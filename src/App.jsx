@@ -1,12 +1,11 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, createContext, useContext } from "react";
+import { createClient } from "@supabase/supabase-js";
 
-// ─── STORAGE (localStorage) ───────────────────────────────────────────────────
-const SK = { players:"bball_players", games:"bball_games", logs:"bball_gamelogs" };
-
-const store = {
-  get: (key) => { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; } },
-  set: (key, val) => { try { localStorage.setItem(key, JSON.stringify(val)); } catch(e) { console.error("Storage error", e); } },
-};
+// ─── SUPABASE CLIENT ──────────────────────────────────────────────────────────
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY
+);
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const STAT_FIELDS = [
@@ -16,15 +15,23 @@ const STAT_FIELDS = [
   {key:"ast",label:"AST"},{key:"stl",label:"STL"},{key:"blk",label:"BLK"},
   {key:"tov",label:"TOV"},{key:"pf",label:"PF"},
 ];
-const BOX_COLS   = ["pts","fgm","fga","tpm","tpa","ftm","fta","oreb","dreb","ast","stl","blk","tov","pf"];
-const ANOMALY    = {pts:35,ast:12,stl:7,blk:7};
-const J_COLORS   = ["#f97316","#3b82f6","#22c55e","#a855f7","#ec4899","#eab308","#06b6d4","#f43f5e"];
+const BOX_COLS  = ["pts","fgm","fga","tpm","tpa","ftm","fta","oreb","dreb","ast","stl","blk","tov","pf"];
+const ANOMALY   = {pts:35,ast:12,stl:7,blk:7};
+const J_COLORS  = ["#f97316","#3b82f6","#22c55e","#a855f7","#ec4899","#eab308","#06b6d4","#f43f5e"];
 const emptyStats = () => Object.fromEntries(STAT_FIELDS.map(f=>[f.key,""]));
 const newId      = p  => `${p}_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
 const today      = () => new Date().toISOString().slice(0,10);
 const MONTHS     = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const monthShort = d  => { try { return MONTHS[new Date(d+"T12:00:00").getMonth()]; } catch { return ""; } };
 const formatDate = d  => { try { const dt=new Date(d+"T12:00:00"); return `${MONTHS[dt.getMonth()]} ${dt.getDate()}, ${dt.getFullYear()}`; } catch { return d; } };
+
+// ─── DB ROW TRANSFORMERS ──────────────────────────────────────────────────────
+// Supabase uses snake_case; app uses camelCase for playerId / gameId
+const logFromDB = l => ({ ...l, playerId: l.player_id, gameId: l.game_id });
+const logToDB   = l => {
+  const { playerId, gameId, ...rest } = l;
+  return { ...rest, player_id: playerId, game_id: gameId };
+};
 
 // ─── ANALYTICS ────────────────────────────────────────────────────────────────
 const calcTS  = (p,a,f) => { const t=a+0.44*f; return t>0?p/(2*t):0; };
@@ -62,47 +69,72 @@ function flagStats(row) {
   return f;
 }
 
-// ─── DATA HOOK ────────────────────────────────────────────────────────────────
+// ─── REAL-TIME DATA HOOK ──────────────────────────────────────────────────────
 function useAppData() {
   const [players, setPlayers] = useState([]);
   const [games,   setGames]   = useState([]);
   const [logs,    setLogs]    = useState([]);
   const [ready,   setReady]   = useState(false);
+  const [syncStatus, setSyncStatus] = useState("connecting"); // connecting | live | error
 
-  useEffect(() => {
-    setPlayers(store.get(SK.players) || []);
-    setGames  (store.get(SK.games)   || []);
-    setLogs   (store.get(SK.logs)    || []);
-    setReady(true);
+  // ── Loaders ──
+  const loadPlayers = useCallback(async () => {
+    const { data, error } = await supabase.from("players").select("*").order("created_at");
+    if (!error && data) setPlayers(data);
   }, []);
 
-  const savePlayers = useCallback(arr => { store.set(SK.players, arr); setPlayers(arr); }, []);
-  const saveGames   = useCallback(arr => { store.set(SK.games,   arr); setGames(arr);   }, []);
-  const saveLogs    = useCallback(arr => { store.set(SK.logs,    arr); setLogs(arr);    }, []);
+  const loadGames = useCallback(async () => {
+    const { data, error } = await supabase.from("games").select("*").order("date", { ascending: false });
+    if (!error && data) setGames(data);
+  }, []);
 
-  return { players, games, logs, ready, savePlayers, saveGames, saveLogs };
-}
+  const loadLogs = useCallback(async () => {
+    const { data, error } = await supabase.from("gamelogs").select("*");
+    if (!error && data) setLogs(data.map(logFromDB));
+  }, []);
 
-// ─── OCR (Claude Vision) ──────────────────────────────────────────────────────
-async function runOCR(b64, mime, apiKey) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method:"POST",
-    headers:{ "Content-Type":"application/json", "x-api-key": apiKey, "anthropic-version":"2023-06-01", "anthropic-dangerous-direct-browser-access":"true" },
-    body: JSON.stringify({
-      model:"claude-sonnet-4-20250514", max_tokens:1000,
-      system:`You are a basketball scoresheet OCR engine. Return ONLY a raw JSON array (no markdown, no explanation).
-Each element: {"name":"","number":"","pts":0,"fgm":0,"fga":0,"tpm":0,"tpa":0,"ftm":0,"fta":0,"oreb":0,"dreb":0,"ast":0,"stl":0,"blk":0,"tov":0,"pf":0,"illegible":false}
-Use 0 for blank/illegible fields. Set illegible:true if any field was unreadable.`,
-      messages:[{ role:"user", content:[
-        { type:"image", source:{ type:"base64", media_type:mime, data:b64 }},
-        { type:"text",  text:"Extract all player stats from this scoresheet." }
-      ]}]
-    })
-  });
-  if (!res.ok) throw new Error(`API error ${res.status}`);
-  const data = await res.json();
-  const text = data.content?.map(c=>c.text||"").join("")||"[]";
-  return JSON.parse(text.replace(/```json|```/g,"").trim());
+  // ── Initial load + real-time subscription ──
+  useEffect(() => {
+    Promise.all([loadPlayers(), loadGames(), loadLogs()])
+      .then(() => setReady(true))
+      .catch(() => setSyncStatus("error"));
+
+    const channel = supabase
+      .channel("db-all-changes")
+      .on("postgres_changes", { event: "*", schema: "public", table: "players" },  () => loadPlayers())
+      .on("postgres_changes", { event: "*", schema: "public", table: "games" },    () => loadGames())
+      .on("postgres_changes", { event: "*", schema: "public", table: "gamelogs" }, () => loadLogs())
+      .subscribe(status => {
+        setSyncStatus(status === "SUBSCRIBED" ? "live" : status === "CLOSED" ? "error" : "connecting");
+      });
+
+    return () => supabase.removeChannel(channel);
+  }, [loadPlayers, loadGames, loadLogs]);
+
+  // ── Writers ──
+  // Players: upsert new/changed, delete removed
+  const savePlayers = useCallback(async (newArr) => {
+    const toDelete = players.filter(p => !newArr.find(np => np.id === p.id));
+    if (toDelete.length) await supabase.from("players").delete().in("id", toDelete.map(p => p.id));
+    if (newArr.length)   await supabase.from("players").upsert(newArr);
+    setPlayers(newArr);
+  }, [players]);
+
+  const saveGames = useCallback(async (newArr) => {
+    const toDelete = games.filter(g => !newArr.find(ng => ng.id === g.id));
+    if (toDelete.length) await supabase.from("games").delete().in("id", toDelete.map(g => g.id));
+    if (newArr.length)   await supabase.from("games").upsert(newArr);
+    setGames(newArr);
+  }, [games]);
+
+  const saveLogs = useCallback(async (newArr) => {
+    const toDelete = logs.filter(l => !newArr.find(nl => nl.id === l.id));
+    if (toDelete.length) await supabase.from("gamelogs").delete().in("id", toDelete.map(l => l.id));
+    if (newArr.length)   await supabase.from("gamelogs").upsert(newArr.map(logToDB));
+    setLogs(newArr);
+  }, [logs]);
+
+  return { players, games, logs, ready, syncStatus, savePlayers, saveGames, saveLogs };
 }
 
 // ─── SHARED UI ────────────────────────────────────────────────────────────────
@@ -116,15 +148,17 @@ const Empty      = ({icon,title,sub})    => (
     <div style={{color:"#555",fontSize:13,lineHeight:1.6}}>{sub}</div>
   </div>
 );
-const Centered   = ({children})          => <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"40px 20px",textAlign:"center"}}>{children}</div>;
-const Spinner    = ({label,sub})         => (
+const Centered = ({children}) => (
+  <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"40px 20px",textAlign:"center"}}>{children}</div>
+);
+const Spinner = ({label,sub}) => (
   <Centered>
     <div className="hoop-spinner" style={{marginBottom:20}}/>
     <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:26,color:"#f97316",letterSpacing:2}}>{label}</div>
     {sub&&<div style={{color:"#666",fontSize:13,marginTop:6}}>{sub}</div>}
   </Centered>
 );
-const SubHeader  = ({title,sub,showBack,onBack,right}) => (
+const SubHeader = ({title,sub,showBack,onBack,right}) => (
   <div style={{background:"#111",borderBottom:"1px solid #1e1e1e",padding:"14px 18px",flexShrink:0}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
       <div style={{display:"flex",alignItems:"center",gap:8}}>
@@ -139,19 +173,35 @@ const SubHeader  = ({title,sub,showBack,onBack,right}) => (
   </div>
 );
 
+// ─── SYNC STATUS DOT ─────────────────────────────────────────────────────────
+function SyncDot({ status }) {
+  const colors = { live:"#22c55e", connecting:"#f97316", error:"#ef4444" };
+  const labels = { live:"Live", connecting:"Syncing…", error:"Offline" };
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:5}}>
+      <div style={{width:7,height:7,borderRadius:"50%",background:colors[status]||"#555",
+        boxShadow: status==="live"?"0 0 0 2px #22c55e33":"none",
+        animation: status==="connecting"?"pulse 1.5s infinite":"none"}}/>
+      <span style={{fontSize:10,color:colors[status]||"#555",fontWeight:600,textTransform:"uppercase",letterSpacing:0.5}}>
+        {labels[status]||status}
+      </span>
+    </div>
+  );
+}
+
 // ─── API KEY GATE ─────────────────────────────────────────────────────────────
-function ApiKeyGate({ apiKey, onSave }) {
+function ApiKeyGate({ onSave }) {
   const [val, setVal] = useState("");
   return (
     <Centered>
       <div style={{fontSize:44,marginBottom:16}}>🔑</div>
       <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:26,color:"#f97316",letterSpacing:2,marginBottom:8}}>SCANNER SETUP</div>
       <div style={{color:"#888",fontSize:13,marginBottom:24,maxWidth:320,lineHeight:1.6}}>
-        The scanner uses Claude Vision API. Enter your Anthropic API key — it's saved only in your browser's local storage and never sent anywhere except Anthropic.
+        Enter your Anthropic API key to enable the scoresheet scanner. It's saved only in your browser and only sent to Anthropic.
       </div>
       <input value={val} onChange={e=>setVal(e.target.value)} placeholder="sk-ant-api03-..." type="password"
-        style={{width:"100%",maxWidth:340,background:"#1a1a1a",border:"1px solid #2a2a2a",borderRadius:10,color:"#fff",padding:"12px 14px",fontSize:14,marginBottom:12,fontFamily:"'DM Sans',sans-serif"}}/>
-      <button className="btn-primary" style={{width:"100%",maxWidth:340}} onClick={()=>{ if(val.trim()) onSave(val.trim()); }} disabled={!val.trim()}>
+        style={{width:"100%",maxWidth:340,background:"#1a1a1a",border:"1px solid #2a2a2a",borderRadius:10,color:"#fff",padding:"12px 14px",fontSize:14,marginBottom:12}}/>
+      <button className="btn-primary" style={{width:"100%",maxWidth:340}} onClick={()=>{ if(val.trim()){ localStorage.setItem("bball_apikey",val.trim()); onSave(val.trim()); }}} disabled={!val.trim()}>
         SAVE KEY & CONTINUE
       </button>
       <div style={{marginTop:12,fontSize:11,color:"#444"}}>Get a key at console.anthropic.com</div>
@@ -159,23 +209,43 @@ function ApiKeyGate({ apiKey, onSave }) {
   );
 }
 
+// ─── OCR ──────────────────────────────────────────────────────────────────────
+async function runOCR(b64, mime, apiKey) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST",
+    headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+    body: JSON.stringify({
+      model:"claude-sonnet-4-20250514", max_tokens:1000,
+      system:`You are a basketball scoresheet OCR engine. Return ONLY a raw JSON array (no markdown).
+Each element: {"name":"","number":"","pts":0,"fgm":0,"fga":0,"tpm":0,"tpa":0,"ftm":0,"fta":0,"oreb":0,"dreb":0,"ast":0,"stl":0,"blk":0,"tov":0,"pf":0,"illegible":false}
+Use 0 for blank/illegible fields. Set illegible:true if any field was unreadable.`,
+      messages:[{role:"user",content:[
+        {type:"image",source:{type:"base64",media_type:mime,data:b64}},
+        {type:"text",text:"Extract all player stats from this scoresheet."}
+      ]}]
+    })
+  });
+  if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const text = data.content?.map(c=>c.text||"").join("")||"[]";
+  return JSON.parse(text.replace(/```json|```/g,"").trim());
+}
+
 // ─── MODULE: SCANNER ─────────────────────────────────────────────────────────
 function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDone }) {
-  const [apiKey, setApiKey]   = useState(() => localStorage.getItem("bball_apikey")||"");
-  const [step,  setStep]      = useState("upload");
-  const [preview,setPrev]     = useState(null);
-  const [b64,   setB64]       = useState(null);
-  const [mime,  setMime]      = useState("image/jpeg");
-  const [rows,  setRows]      = useState([]);
-  const [flags, setFlags]     = useState([]);
-  const [gameInfo, setGameInfo] = useState({date:today(),opponent:"",result:""});
-  const [err,   setErr]       = useState(null);
+  const [apiKey,setApiKey] = useState(()=>localStorage.getItem("bball_apikey")||"");
+  const [step,setStep]     = useState("upload");
+  const [preview,setPrev]  = useState(null);
+  const [b64,setB64]       = useState(null);
+  const [mime,setMime]     = useState("image/jpeg");
+  const [rows,setRows]     = useState([]);
+  const [flags,setFlags]   = useState([]);
+  const [gameInfo,setGame] = useState({date:today(),opponent:"",result:""});
+  const [err,setErr]       = useState(null);
   const fileRef = useRef();
 
-  const saveKey = key => { localStorage.setItem("bball_apikey", key); setApiKey(key); };
-
   const handleFile = f => {
-    if (!f) return; setMime(f.type||"image/jpeg");
+    if(!f) return; setMime(f.type||"image/jpeg");
     const r=new FileReader();
     r.onload=e=>{ setPrev(e.target.result); setB64(e.target.result.split(",")[1]); setStep("ready"); };
     r.readAsDataURL(f);
@@ -184,7 +254,7 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
   const scan = async () => {
     setStep("scanning"); setErr(null);
     try {
-      const ext = await runOCR(b64, mime, apiKey);
+      const ext = await runOCR(b64,mime,apiKey);
       const enriched = ext.map(r=>({...emptyStats(),...r,name:r.name||"",number:r.number||""}));
       setRows(enriched); setFlags(enriched.map(r=>flagStats(r))); setStep("review");
     } catch(e) { setErr("Scan failed: "+e.message); setStep("ready"); }
@@ -195,7 +265,7 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
     setRows(next); setFlags(next.map(r=>flagStats(r)));
   };
 
-  const save = () => {
+  const save = async () => {
     setStep("saving");
     try {
       const gameId=newId("g");
@@ -205,34 +275,35 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
         if (!row.name.trim()) continue;
         let p=updPl.find(p=>p.name.toLowerCase()===row.name.toLowerCase());
         if (!p){ p={id:newId("p"),name:row.name.trim(),number:row.number}; updPl.push(p); }
-        newLogs.push({ id:newId("gl"), playerId:p.id, gameId,
-          ...Object.fromEntries(STAT_FIELDS.map(f=>[f.key,Number(row[f.key])||0])) });
+        newLogs.push({id:newId("gl"),playerId:p.id,gameId,
+          ...Object.fromEntries(STAT_FIELDS.map(f=>[f.key,Number(row[f.key])||0]))});
       }
-      savePlayers(updPl);
-      saveGames([...games,{id:gameId,date:gameInfo.date,opponent:gameInfo.opponent,result:gameInfo.result}]);
-      saveLogs([...logs,...newLogs]);
+      await savePlayers(updPl);
+      await saveGames([...games,{id:gameId,date:gameInfo.date,opponent:gameInfo.opponent,result:gameInfo.result}]);
+      await saveLogs([...logs,...newLogs]);
       setStep("done");
     } catch(e) { setErr("Save failed: "+e.message); setStep("review"); }
   };
 
   const reset = () => {
     setStep("upload"); setPrev(null); setB64(null); setRows([]); setFlags([]); setErr(null);
-    setGameInfo({date:today(),opponent:"",result:""});
+    setGame({date:today(),opponent:"",result:""});
   };
 
   const totalFlags = flags.reduce((s,f)=>s+Object.keys(f).length,0);
 
-  if (!apiKey) return <ApiKeyGate onSave={saveKey}/>;
+  if (!apiKey) return <ApiKeyGate onSave={setApiKey}/>;
   if (step==="scanning") return <Spinner label="SCANNING..." sub="Claude Vision is reading your scoresheet"/>;
-  if (step==="saving")   return <Spinner label="SAVING..."   sub="Writing to local storage"/>;
+  if (step==="saving")   return <Spinner label="SAVING..." sub="Syncing to shared database"/>;
 
   if (step==="done") return (
     <Centered>
       <div style={{fontSize:64,marginBottom:12}}>🏆</div>
       <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:30,color:"#f97316",letterSpacing:2,marginBottom:8}}>STATS SAVED!</div>
-      <div style={{color:"#aaa",fontSize:14,marginBottom:32,lineHeight:1.7}}>
+      <div style={{color:"#aaa",fontSize:14,marginBottom:10,lineHeight:1.7}}>
         {rows.filter(r=>r.name.trim()).length} players · <strong style={{color:"#fff"}}>{gameInfo.opponent||"game"}</strong> · {gameInfo.date}
       </div>
+      <div style={{color:"#22c55e",fontSize:12,marginBottom:28}}>✓ Synced to all devices</div>
       <div style={{display:"flex",gap:10}}>
         <button className="btn-ghost" onClick={reset}>Scan Another</button>
         <button className="btn-primary" onClick={()=>onDone("games")}>View Games →</button>
@@ -247,16 +318,16 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
       {(step==="upload"||step==="ready")&&<>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
           <span style={{fontSize:11,color:"#555"}}>Scanner key set ✓</span>
-          <button onClick={()=>{ localStorage.removeItem("bball_apikey"); setApiKey(""); }} style={{background:"none",border:"none",color:"#555",cursor:"pointer",fontSize:11,textDecoration:"underline"}}>Change key</button>
+          <button onClick={()=>{localStorage.removeItem("bball_apikey");setApiKey("");}} style={{background:"none",border:"none",color:"#555",cursor:"pointer",fontSize:11,textDecoration:"underline"}}>Change key</button>
         </div>
 
         <Card style={{marginBottom:14}}>
           <SectionLbl>Game Details</SectionLbl>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-            <Field label="Date"><input type="date" value={gameInfo.date} onChange={e=>setGameInfo(g=>({...g,date:e.target.value}))} className="text-input"/></Field>
-            <Field label="Opponent"><input type="text" value={gameInfo.opponent} placeholder="Team name" onChange={e=>setGameInfo(g=>({...g,opponent:e.target.value}))} className="text-input"/></Field>
+            <Field label="Date"><input type="date" value={gameInfo.date} onChange={e=>setGame(g=>({...g,date:e.target.value}))} className="text-input"/></Field>
+            <Field label="Opponent"><input type="text" value={gameInfo.opponent} placeholder="Team name" onChange={e=>setGame(g=>({...g,opponent:e.target.value}))} className="text-input"/></Field>
             <div style={{gridColumn:"span 2"}}>
-              <Field label="Result (e.g. W 62-54)"><input type="text" value={gameInfo.result} placeholder="W 62-54" onChange={e=>setGameInfo(g=>({...g,result:e.target.value}))} className="text-input" style={{width:"100%"}}/></Field>
+              <Field label="Result (e.g. W 62-54)"><input type="text" value={gameInfo.result} placeholder="W 62-54" onChange={e=>setGame(g=>({...g,result:e.target.value}))} className="text-input" style={{width:"100%"}}/></Field>
             </div>
           </div>
         </Card>
@@ -279,26 +350,21 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
           <div><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:20,letterSpacing:1}}>REVIEW STATS</div><div style={{fontSize:12,color:"#666"}}>{rows.length} players extracted</div></div>
           {totalFlags>0&&<span className="badge badge-red">⚠ {totalFlags} flag{totalFlags>1?"s":""}</span>}
         </div>
-
         {rows.map((row,ri)=>{
           const rf=flags[ri]||{};
           return (
             <Card key={ri} style={{marginBottom:10,border:`1px solid ${Object.keys(rf).length?"#ef444455":"#222"}`}}>
               <div style={{display:"flex",gap:8,marginBottom:10,alignItems:"center"}}>
                 <div className="jersey-badge" style={{background:"#f97316"}}>{row.number||"?"}</div>
-                <input value={row.name} placeholder="Player name" onChange={e=>updateCell(ri,"name",e.target.value)}
-                  style={{flex:1,background:"#1a1a1a",border:"1px solid #2a2a2a",borderRadius:8,color:"#fff",padding:"7px 10px",fontSize:15,fontWeight:600}}/>
-                <input value={row.number} placeholder="#" onChange={e=>updateCell(ri,"number",e.target.value)}
-                  style={{width:44,background:"#1a1a1a",border:"1px solid #2a2a2a",borderRadius:8,color:"#fff",padding:"7px 5px",fontSize:14,textAlign:"center"}}/>
-                <button onClick={()=>{setRows(r=>r.filter((_,i)=>i!==ri));setFlags(f=>f.filter((_,i)=>i!==ri));}}
-                  style={{background:"none",border:"none",color:"#555",fontSize:20,cursor:"pointer",padding:"4px",lineHeight:1}}>×</button>
+                <input value={row.name} placeholder="Player name" onChange={e=>updateCell(ri,"name",e.target.value)} style={{flex:1,background:"#1a1a1a",border:"1px solid #2a2a2a",borderRadius:8,color:"#fff",padding:"7px 10px",fontSize:15,fontWeight:600}}/>
+                <input value={row.number} placeholder="#" onChange={e=>updateCell(ri,"number",e.target.value)} style={{width:44,background:"#1a1a1a",border:"1px solid #2a2a2a",borderRadius:8,color:"#fff",padding:"7px 5px",fontSize:14,textAlign:"center"}}/>
+                <button onClick={()=>{setRows(r=>r.filter((_,i)=>i!==ri));setFlags(f=>f.filter((_,i)=>i!==ri));}} style={{background:"none",border:"none",color:"#555",fontSize:20,cursor:"pointer",padding:"4px",lineHeight:1}}>×</button>
               </div>
               <div style={{display:"flex",flexWrap:"wrap",gap:7}}>
                 {STAT_FIELDS.map(f=>(
                   <div key={f.key} style={{textAlign:"center"}}>
                     <div style={{fontSize:9,color:rf[f.key]?"#ef4444":"#555",marginBottom:3,fontWeight:700,textTransform:"uppercase"}}>{f.label}</div>
-                    <input type="number" min="0" value={row[f.key]} onChange={e=>updateCell(ri,f.key,e.target.value)}
-                      style={{width:44,background:rf[f.key]?"#1f0e0e":"#1a1a1a",border:`1px solid ${rf[f.key]?"#ef4444":"#2a2a2a"}`,borderRadius:7,color:"#fff",padding:"5px 3px",textAlign:"center",fontSize:13}}/>
+                    <input type="number" min="0" value={row[f.key]} onChange={e=>updateCell(ri,f.key,e.target.value)} style={{width:44,background:rf[f.key]?"#1f0e0e":"#1a1a1a",border:`1px solid ${rf[f.key]?"#ef4444":"#2a2a2a"}`,borderRadius:7,color:"#fff",padding:"5px 3px",textAlign:"center",fontSize:13}}/>
                   </div>
                 ))}
               </div>
@@ -306,11 +372,8 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
             </Card>
           );
         })}
-        <button className="btn-ghost btn-full" style={{marginBottom:10}}
-          onClick={()=>{setRows(r=>[...r,{name:"",number:"",...emptyStats()}]);setFlags(f=>[...f,{}]);}}>
-          + Add Player Manually
-        </button>
-        <button className="btn-primary btn-full" onClick={save}>💾 SAVE TO DATABASE</button>
+        <button className="btn-ghost btn-full" style={{marginBottom:10}} onClick={()=>{setRows(r=>[...r,{name:"",number:"",...emptyStats()}]);setFlags(f=>[...f,{}]);}}>+ Add Player Manually</button>
+        <button className="btn-primary btn-full" onClick={save}>💾 SAVE & SYNC TO ALL DEVICES</button>
       </>}
     </div>
   );
@@ -328,58 +391,46 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
   const openDetail = g => { setSelGame(g); setView("detail"); setDelConfirm(false); };
   const goBack     = () => { setView(view==="detail"?"list":view==="editInfo"?"detail":"list"); setDelConfirm(false); };
 
-  const addGame = () => {
+  const addGame = async () => {
     if (!form.opponent.trim()) return; setSaving(true);
-    saveGames([...games,{id:newId("g"),date:form.date,opponent:form.opponent.trim(),result:form.result.trim()}]);
+    await saveGames([...games,{id:newId("g"),date:form.date,opponent:form.opponent.trim(),result:form.result.trim()}]);
     setSaving(false); setView("list");
   };
 
-  const saveEdit = () => {
+  const saveEdit = async () => {
     setSaving(true);
-    saveGames(games.map(g=>g.id===editForm.id?editForm:g));
+    await saveGames(games.map(g=>g.id===editForm.id?editForm:g));
     setSelGame(editForm); setSaving(false); setView("detail");
   };
 
-  const deleteGame = id => {
-    saveGames(games.filter(g=>g.id!==id));
-    saveLogs(logs.filter(l=>l.gameId!==id));
+  const deleteGame = async id => {
+    await saveGames(games.filter(g=>g.id!==id));
+    await saveLogs(logs.filter(l=>l.gameId!==id));
     setView("list"); setDelConfirm(false);
   };
 
   const getBoxScore = gameId => {
-    const gl = logs.filter(l=>l.gameId===gameId);
-    const rows = gl.map(l=>{
-      const p=players.find(p=>p.id===l.playerId);
-      return {...l,playerName:p?.name||"Unknown",playerNumber:p?.number||"?"};
-    }).sort((a,b)=>(b.pts||0)-(a.pts||0));
+    const gl=logs.filter(l=>l.gameId===gameId);
+    const rows=gl.map(l=>{ const p=players.find(p=>p.id===l.playerId); return {...l,playerName:p?.name||"Unknown",playerNumber:p?.number||"?"}; }).sort((a,b)=>(b.pts||0)-(a.pts||0));
     const totals=Object.fromEntries(BOX_COLS.map(k=>[k,rows.reduce((s,r)=>s+(Number(r[k])||0),0)]));
     return {rows,totals};
   };
 
-  const resultColor = r => {
-    if (!r) return "#555";
-    const u=r.trim().toUpperCase();
-    if (u.startsWith("W")) return "#22c55e";
-    if (u.startsWith("L")) return "#ef4444";
-    return "#f97316";
-  };
-
+  const resultColor = r => { if(!r) return "#555"; const u=r.trim().toUpperCase(); if(u.startsWith("W")) return "#22c55e"; if(u.startsWith("L")) return "#ef4444"; return "#f97316"; };
   const sorted = [...games].sort((a,b)=>b.date.localeCompare(a.date));
 
-  // LIST
   if (view==="list") return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <SubHeader title="🗓 GAMES" sub={`${games.length} game${games.length!==1?"s":""} this season`}
         right={<button className="btn-primary" style={{padding:"7px 14px",fontSize:13}} onClick={()=>{setForm({date:today(),opponent:"",result:""});setView("add");}}>+ Add</button>}/>
       <div className="module-scroll">
-        {sorted.length===0
-          ? <Empty icon="🗓" title="NO GAMES YET" sub="Add a game manually or scan a scoresheet"/>
+        {sorted.length===0 ? <Empty icon="🗓" title="NO GAMES YET" sub="Add a game manually or scan a scoresheet"/>
           : sorted.map(g=>{
               const {rows,totals}=getBoxScore(g.id);
               const rc=resultColor(g.result);
               return (
                 <div key={g.id} className="list-row" onClick={()=>openDetail(g)}>
-                  <div style={{width:5,background:rc,alignSelf:"stretch",borderRadius:"4px 0 0 4px",flexShrink:0}}/>
+                  <div style={{width:5,background:rc,alignSelf:"stretch",flexShrink:0}}/>
                   <div style={{flex:1,padding:"14px 12px",display:"flex",alignItems:"center",gap:12}}>
                     <div style={{textAlign:"center",flexShrink:0,minWidth:36}}>
                       <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:22,color:"#f97316",lineHeight:1}}>{g.date?g.date.slice(8):"—"}</div>
@@ -389,24 +440,22 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontWeight:700,fontSize:15,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{g.opponent||"Unknown Opponent"}</div>
                       <div style={{fontSize:12,color:"#666",marginTop:2,display:"flex",gap:10}}>
-                        <span>{rows.length} player{rows.length!==1?"s":""} logged</span>
+                        <span>{rows.length} player{rows.length!==1?"s":""}</span>
                         {totals.pts>0&&<span style={{color:"#888"}}>{totals.pts} team pts</span>}
                       </div>
                     </div>
-                    {g.result
-                      ? <div style={{background:`${rc}22`,color:rc,border:`1px solid ${rc}44`,borderRadius:8,padding:"4px 10px",fontSize:12,fontWeight:700,whiteSpace:"nowrap",flexShrink:0}}>{g.result}</div>
-                      : <div style={{color:"#2a2a2a",fontSize:12,flexShrink:0}}>No result</div>}
+                    {g.result ? <div style={{background:`${rc}22`,color:rc,border:`1px solid ${rc}44`,borderRadius:8,padding:"4px 10px",fontSize:12,fontWeight:700,whiteSpace:"nowrap",flexShrink:0}}>{g.result}</div>
+                              : <div style={{color:"#2a2a2a",fontSize:12,flexShrink:0}}>—</div>}
                     <div style={{color:"#2a2a2a",fontSize:18}}>›</div>
                   </div>
                 </div>
               );
-            })
+          })
         }
       </div>
     </div>
   );
 
-  // ADD
   if (view==="add") return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <SubHeader title="NEW GAME" showBack onBack={goBack}/>
@@ -423,14 +472,10 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
             <button className="btn-primary" style={{flex:2}} onClick={addGame} disabled={!form.opponent.trim()||saving}>{saving?"SAVING...":"CREATE GAME"}</button>
           </div>
         </Card>
-        <div style={{marginTop:14,background:"#111",border:"1px solid #1e1e1e",borderRadius:12,padding:"12px 14px"}}>
-          <div style={{fontSize:12,color:"#555",lineHeight:1.7}}>💡 After creating a game, head to <strong style={{color:"#666"}}>Players</strong> and tap <strong style={{color:"#666"}}>+ Log</strong> on any player to enter their stats. Or use the Scanner to import a full scoresheet automatically.</div>
-        </div>
       </div>
     </div>
   );
 
-  // EDIT
   if (view==="editInfo"&&editForm) return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <SubHeader title="EDIT GAME" showBack onBack={goBack}/>
@@ -451,7 +496,6 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
     </div>
   );
 
-  // BOX SCORE
   if (view==="detail"&&selGame) {
     const {rows:boxRows,totals}=getBoxScore(selGame.id);
     const rc=resultColor(selGame.result);
@@ -460,58 +504,45 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
         <SubHeader title="BOX SCORE" showBack onBack={goBack}
           right={<div style={{display:"flex",gap:6}}>
             <button className="btn-ghost" style={{padding:"7px 11px",fontSize:13}} onClick={()=>{setEditForm({...selGame});setView("editInfo");}}>✏️</button>
-            <button className="btn-ghost" style={{padding:"7px 11px",fontSize:13,borderColor:delConfirm?"#ef4444":"#2a2a2a",color:delConfirm?"#ef4444":"#666"}}
-              onClick={()=>{ if(delConfirm) deleteGame(selGame.id); else setDelConfirm(true); }}>
-              {delConfirm?"CONFIRM ⚠":"🗑"}
-            </button>
+            <button className="btn-ghost" style={{padding:"7px 11px",fontSize:13,borderColor:delConfirm?"#ef4444":"#2a2a2a",color:delConfirm?"#ef4444":"#666"}} onClick={()=>{ if(delConfirm) deleteGame(selGame.id); else setDelConfirm(true); }}>{delConfirm?"CONFIRM ⚠":"🗑"}</button>
           </div>}/>
-
         <div className="module-scroll">
-          {/* Game banner */}
           <div style={{background:"linear-gradient(135deg,#111,#161616)",border:`1px solid ${rc}33`,borderRadius:18,padding:18,marginBottom:16,position:"relative",overflow:"hidden"}}>
-            <div style={{position:"absolute",top:0,left:0,width:5,bottom:0,background:rc,borderRadius:"4px 0 0 4px"}}/>
+            <div style={{position:"absolute",top:0,left:0,width:5,bottom:0,background:rc}}/>
             <div style={{paddingLeft:12}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
-                <div>
-                  <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:26,letterSpacing:1,lineHeight:1}}>{selGame.opponent||"Unknown Opponent"}</div>
-                  <div style={{fontSize:13,color:"#666",marginTop:3}}>{formatDate(selGame.date)}</div>
-                </div>
+                <div><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:26,letterSpacing:1,lineHeight:1}}>{selGame.opponent||"Unknown"}</div><div style={{fontSize:13,color:"#666",marginTop:3}}>{formatDate(selGame.date)}</div></div>
                 {selGame.result&&<div style={{background:`${rc}22`,color:rc,border:`1px solid ${rc}55`,borderRadius:10,padding:"6px 14px",fontFamily:"'Bebas Neue',cursive",fontSize:22,letterSpacing:1}}>{selGame.result}</div>}
               </div>
               <div style={{display:"flex",gap:20,flexWrap:"wrap"}}>
                 {[["Players",boxRows.length],["Team PTS",totals.pts],["Rebounds",(totals.oreb||0)+(totals.dreb||0)],["Assists",totals.ast]].map(([l,v])=>(
-                  <div key={l}><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:24,color:"#f97316",lineHeight:1}}>{v}</div><div style={{fontSize:10,color:"#555",textTransform:"uppercase",letterSpacing:0.5}}>{l}</div></div>
+                  <div key={l}><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:24,color:"#f97316",lineHeight:1}}>{v}</div><div style={{fontSize:10,color:"#555",textTransform:"uppercase"}}>{l}</div></div>
                 ))}
               </div>
             </div>
           </div>
 
           {delConfirm&&<div style={{background:"rgba(239,68,68,0.1)",border:"1px solid #ef444466",borderRadius:12,padding:"12px 16px",marginBottom:14}}>
-            <div style={{fontSize:13,color:"#ef4444",fontWeight:600,marginBottom:10}}>⚠️ Delete this game and all {boxRows.length} player logs? This cannot be undone.</div>
+            <div style={{fontSize:13,color:"#ef4444",fontWeight:600,marginBottom:10}}>⚠️ Delete this game and all {boxRows.length} player logs?</div>
             <div style={{display:"flex",gap:8}}>
               <button className="btn-ghost" style={{flex:1,fontSize:13}} onClick={()=>setDelConfirm(false)}>Cancel</button>
               <button style={{flex:1,background:"#ef4444",color:"#fff",fontWeight:700,border:"none",borderRadius:10,padding:"9px",cursor:"pointer",fontSize:13}} onClick={()=>deleteGame(selGame.id)}>Yes, Delete</button>
             </div>
           </div>}
 
-          {boxRows.length===0
-            ? <Empty icon="📋" title="NO STATS LOGGED" sub="Go to Players tab and tap '+ Log' to add stats for this game"/>
+          {boxRows.length===0 ? <Empty icon="📋" title="NO STATS LOGGED" sub="Go to Players tab and tap '+ Log' to add stats for this game"/>
             : <>
                 <div style={{background:"#161616",border:"1px solid #222",borderRadius:14,overflow:"hidden",marginBottom:12}}>
                   <div style={{overflowX:"auto"}}>
                     <table style={{width:"100%",borderCollapse:"collapse",minWidth:520}}>
                       <thead>
                         <tr style={{background:"#111"}}>
-                          <th style={{padding:"9px 12px",textAlign:"left",fontSize:10,color:"#444",fontWeight:700,textTransform:"uppercase",letterSpacing:1,position:"sticky",left:0,background:"#111",minWidth:130,whiteSpace:"nowrap"}}>Player</th>
-                          {BOX_COLS.map(k=>(
-                            <th key={k} style={{padding:"9px 7px",textAlign:"center",fontSize:10,color:"#444",fontWeight:700,textTransform:"uppercase",whiteSpace:"nowrap"}}>
-                              {STAT_FIELDS.find(f=>f.key===k)?.label||k}
-                            </th>
-                          ))}
+                          <th style={{padding:"9px 12px",textAlign:"left",fontSize:10,color:"#444",fontWeight:700,textTransform:"uppercase",position:"sticky",left:0,background:"#111",minWidth:130,whiteSpace:"nowrap"}}>Player</th>
+                          {BOX_COLS.map(k=><th key={k} style={{padding:"9px 7px",textAlign:"center",fontSize:10,color:"#444",fontWeight:700,textTransform:"uppercase",whiteSpace:"nowrap"}}>{STAT_FIELDS.find(f=>f.key===k)?.label||k}</th>)}
                         </tr>
                       </thead>
                       <tbody>
-                        {boxRows.map((row,ri)=>{
+                        {boxRows.map(row=>{
                           const pIdx=players.findIndex(p=>p.id===row.playerId);
                           const color=J_COLORS[pIdx%J_COLORS.length]||"#f97316";
                           return (
@@ -522,34 +553,20 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
                                   <span style={{fontWeight:600,fontSize:12}}>{row.playerName}</span>
                                 </div>
                               </td>
-                              {BOX_COLS.map(k=>(
-                                <td key={k} style={{padding:"9px 7px",textAlign:"center",fontSize:13,color:k==="pts"&&(row[k]||0)>20?"#f97316":k==="pts"&&(row[k]||0)>0?"#ddd":"#555",fontWeight:k==="pts"?600:400}}>
-                                  {row[k]||0}
-                                </td>
-                              ))}
+                              {BOX_COLS.map(k=><td key={k} style={{padding:"9px 7px",textAlign:"center",fontSize:13,color:k==="pts"&&(row[k]||0)>20?"#f97316":k==="pts"&&(row[k]||0)>0?"#ddd":"#555",fontWeight:k==="pts"?600:400}}>{row[k]||0}</td>)}
                             </tr>
                           );
                         })}
                         <tr style={{borderTop:"2px solid #2a2a2a",background:"#0f0f0f"}}>
-                          <td style={{padding:"10px 12px",position:"sticky",left:0,background:"#0f0f0f",borderRight:"1px solid #1e1e1e"}}>
-                            <div style={{fontSize:10,fontWeight:700,color:"#f97316",textTransform:"uppercase",letterSpacing:1}}>TEAM</div>
-                          </td>
-                          {BOX_COLS.map(k=>(
-                            <td key={k} style={{padding:"10px 7px",textAlign:"center",fontSize:13,fontWeight:700,color:k==="pts"?"#f97316":"#888"}}>{totals[k]||0}</td>
-                          ))}
+                          <td style={{padding:"10px 12px",position:"sticky",left:0,background:"#0f0f0f",borderRight:"1px solid #1e1e1e"}}><div style={{fontSize:10,fontWeight:700,color:"#f97316",textTransform:"uppercase",letterSpacing:1}}>TEAM</div></td>
+                          {BOX_COLS.map(k=><td key={k} style={{padding:"10px 7px",textAlign:"center",fontSize:13,fontWeight:700,color:k==="pts"?"#f97316":"#888"}}>{totals[k]||0}</td>)}
                         </tr>
                       </tbody>
                     </table>
                   </div>
                 </div>
-
-                {/* Leader callouts */}
                 <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-                  {[
-                    {label:"Top Scorer",   key:"pts", suf:"PTS", fn:r=>(r.pts||0)},
-                    {label:"Top Rebounder",key:"reb", suf:"REB", fn:r=>(r.oreb||0)+(r.dreb||0)},
-                    {label:"Top Passer",   key:"ast", suf:"AST", fn:r=>(r.ast||0)},
-                  ].map(({label,key,suf,fn})=>{
+                  {[{label:"Top Scorer",key:"pts",suf:"PTS",fn:r=>(r.pts||0)},{label:"Top Rebounder",key:"reb",suf:"REB",fn:r=>(r.oreb||0)+(r.dreb||0)},{label:"Top Passer",key:"ast",suf:"AST",fn:r=>(r.ast||0)}].map(({label,key,suf,fn})=>{
                     const best=[...boxRows].sort((a,b)=>fn(b)-fn(a))[0];
                     return (
                       <div key={key} style={{background:"#161616",border:"1px solid #222",borderRadius:12,padding:"12px 10px",textAlign:"center"}}>
@@ -584,16 +601,16 @@ function Roster({ players, games, logs, savePlayers, saveLogs }) {
   const goDetail = p => { setSel(p); setView("detail"); setDtab("avgs"); };
   const goBack   = () => setView(view==="detail"?"list":view==="addPlayer"?"list":"detail");
 
-  const addPlayer = () => {
+  const addPlayer = async () => {
     if (!newName.trim()) return; setSaving(true);
-    savePlayers([...players,{id:newId("p"),name:newName.trim(),number:newNum.trim()}]);
+    await savePlayers([...players,{id:newId("p"),name:newName.trim(),number:newNum.trim()}]);
     setNewName(""); setNewNum(""); setSaving(false); setView("list");
   };
 
-  const deletePlayer = id => {
+  const deletePlayer = async id => {
     if (!window.confirm("Delete player and all their stats?")) return;
-    savePlayers(players.filter(p=>p.id!==id));
-    saveLogs(logs.filter(l=>l.playerId!==id));
+    await savePlayers(players.filter(p=>p.id!==id));
+    await saveLogs(logs.filter(l=>l.playerId!==id));
     setView("list");
   };
 
@@ -603,11 +620,11 @@ function Roster({ players, games, logs, savePlayers, saveLogs }) {
     setSelGame(sorted.length?sorted[0].id:"");
   };
 
-  const saveLog = () => {
+  const saveLog = async () => {
     if (!sel||!selGame) return; setSaving(true);
     const nl={id:newId("gl"),playerId:sel.id,gameId:selGame,...Object.fromEntries(STAT_FIELDS.map(f=>[f.key,Number(logStats[f.key])||0]))};
     const ex=logs.find(l=>l.playerId===sel.id&&l.gameId===selGame);
-    saveLogs(ex?logs.map(l=>l.id===ex.id?{...nl,id:l.id}:l):[...logs,nl]);
+    await saveLogs(ex?logs.map(l=>l.id===ex.id?{...nl,id:l.id}:l):[...logs,nl]);
     setSaving(false); setView("detail");
   };
 
@@ -626,16 +643,11 @@ function Roster({ players, games, logs, savePlayers, saveLogs }) {
       <SubHeader title={view==="list"?"👥 PLAYERS":view==="detail"?sel?.name?.toUpperCase():view==="addPlayer"?"NEW PLAYER":"LOG GAME"}
         showBack={view!=="list"} onBack={goBack} right={hdrRight}/>
       <div className="module-scroll">
-
-        {view==="list"&&(players.length===0
-          ? <Empty icon="👤" title="NO PLAYERS YET" sub="Add players manually or scan a scoresheet to import them"/>
+        {view==="list"&&(players.length===0 ? <Empty icon="👤" title="NO PLAYERS YET" sub="Add players manually or scan a scoresheet"/>
           : players.map((p,i)=>{ const s=getPlayerStats(p.id,logs); return (
               <div key={p.id} className="list-row" onClick={()=>goDetail(p)}>
                 <div className="jersey-badge" style={{background:J_COLORS[i%J_COLORS.length],marginLeft:14}}>{p.number||"?"}</div>
-                <div style={{flex:1}}>
-                  <div style={{fontWeight:700,fontSize:15}}>{p.name}</div>
-                  <div style={{fontSize:12,color:"#666",marginTop:1}}>{s?`${s.gp} GP · ${s.avgs.pts.toFixed(1)} PPG · ${s.avgs.ast.toFixed(1)} APG · ${(s.avgs.oreb+s.avgs.dreb).toFixed(1)} RPG`:"No games logged"}</div>
-                </div>
+                <div style={{flex:1}}><div style={{fontWeight:700,fontSize:15}}>{p.name}</div><div style={{fontSize:12,color:"#666",marginTop:1}}>{s?`${s.gp} GP · ${s.avgs.pts.toFixed(1)} PPG · ${s.avgs.ast.toFixed(1)} APG · ${(s.avgs.oreb+s.avgs.dreb).toFixed(1)} RPG`:"No games logged"}</div></div>
                 <div style={{color:"#2a2a2a",fontSize:20,marginRight:14}}>›</div>
               </div>
             );})
@@ -680,8 +692,7 @@ function Roster({ players, games, logs, savePlayers, saveLogs }) {
 
         {view==="addLog"&&sel&&<Card>
           <SectionLbl>Select Game</SectionLbl>
-          {games.length===0
-            ? <div style={{color:"#666",fontSize:14,marginBottom:16}}>No games yet. Create one in the Games tab first.</div>
+          {games.length===0 ? <div style={{color:"#666",fontSize:14,marginBottom:16}}>No games yet. Create one in the Games tab first.</div>
             : <select value={selGame} onChange={e=>setSelGame(e.target.value)} style={{width:"100%",background:"#1a1a1a",border:"1px solid #2a2a2a",borderRadius:8,color:"#fff",padding:"10px 12px",fontSize:14,marginBottom:16}}>
                 {[...games].sort((a,b)=>b.date.localeCompare(a.date)).map(g=><option key={g.id} value={g.id}>{g.date} vs {g.opponent||"Unknown"}{g.result&&` (${g.result})`}</option>)}
               </select>}
@@ -701,8 +712,8 @@ function Roster({ players, games, logs, savePlayers, saveLogs }) {
   );
 }
 
-// ─── MODULE: ANALYTICS ────────────────────────────────────────────────────────
-const METRICS = [
+// ─── MODULE: ANALYTICS ───────────────────────────────────────────────────────
+const METRICS=[
   {key:"ts", label:"True Shooting %",  fmt:v=>`${(v*100).toFixed(1)}%`, good:0.52,great:0.60, desc:"Points per shooting opportunity, accounting for 3-pointers and free throws."},
   {key:"efg",label:"Eff. Field Goal %",fmt:v=>`${(v*100).toFixed(1)}%`, good:0.48,great:0.56, desc:"Like FG% but gives 50% bonus credit for every 3-pointer made."},
   {key:"per",label:"PER (simplified)", fmt:v=>v.toFixed(1),             good:12,  great:18,   desc:"Player Efficiency Rating. Combines all box score stats. League average ≈ 15."},
@@ -714,8 +725,8 @@ function MBar({value,good,great}) {
 }
 
 function Analytics({ players, logs }) {
-  const [sel,setSel]         = useState(null);
-  const [expanded,setExp]    = useState(null);
+  const [sel,setSel]   = useState(null);
+  const [exp,setExp]   = useState(null);
   useEffect(()=>{ if(players.length&&!sel) setSel(players[0]); },[players]);
   const stat = sel?getPlayerStats(sel.id,logs):null;
 
@@ -723,53 +734,50 @@ function Analytics({ players, logs }) {
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <SubHeader title="📊 ANALYTICS" sub="Basketball Reference formulas"/>
       <div className="module-scroll">
-        {!players.length
-          ? <Empty icon="📈" title="NO DATA YET" sub="Scan a scoresheet or log stats first"/>
-          : <>
-              <div style={{display:"flex",gap:7,overflowX:"auto",paddingBottom:6,marginBottom:18}}>
-                {players.map(p=>{ const s=getPlayerStats(p.id,logs); return (
-                  <button key={p.id} onClick={()=>{setSel(p);setExp(null);}}
-                    style={{flexShrink:0,background:sel?.id===p.id?"#f97316":"#161616",color:sel?.id===p.id?"#000":"#aaa",border:`1px solid ${sel?.id===p.id?"#f97316":"#222"}`,borderRadius:10,padding:"7px 13px",cursor:"pointer",fontSize:13,fontWeight:600,whiteSpace:"nowrap",transition:"all 0.2s"}}>
-                    {p.name.split(" ")[0]}{s&&<span style={{opacity:0.7,fontSize:11,marginLeft:3}}>({s.gp}G)</span>}
-                  </button>
-                );})}
+        {!players.length ? <Empty icon="📈" title="NO DATA YET" sub="Scan a scoresheet or log stats first"/> : <>
+          <div style={{display:"flex",gap:7,overflowX:"auto",paddingBottom:6,marginBottom:18}}>
+            {players.map(p=>{ const s=getPlayerStats(p.id,logs); return (
+              <button key={p.id} onClick={()=>{setSel(p);setExp(null);}}
+                style={{flexShrink:0,background:sel?.id===p.id?"#f97316":"#161616",color:sel?.id===p.id?"#000":"#aaa",border:`1px solid ${sel?.id===p.id?"#f97316":"#222"}`,borderRadius:10,padding:"7px 13px",cursor:"pointer",fontSize:13,fontWeight:600,whiteSpace:"nowrap",transition:"all 0.2s"}}>
+                {p.name.split(" ")[0]}{s&&<span style={{opacity:0.7,fontSize:11,marginLeft:3}}>({s.gp}G)</span>}
+              </button>
+            );})}
+          </div>
+          {stat&&sel?<>
+            <div style={{background:"linear-gradient(135deg,#1a1000,#111)",border:"1px solid #f9731622",borderRadius:18,padding:18,marginBottom:16}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+                <div><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:22,letterSpacing:1}}>{sel.name}</div><div style={{color:"#666",fontSize:12}}>{stat.gp} games</div></div>
+                <div style={{textAlign:"right"}}><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:40,color:"#f97316",lineHeight:1}}>{stat.per.toFixed(1)}</div><div style={{fontSize:10,color:"#666",textTransform:"uppercase",letterSpacing:1}}>PER</div></div>
               </div>
-              {stat&&sel?<>
-                <div style={{background:"linear-gradient(135deg,#1a1000,#111)",border:"1px solid #f9731622",borderRadius:18,padding:18,marginBottom:16}}>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
-                    <div><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:22,letterSpacing:1}}>{sel.name}</div><div style={{color:"#666",fontSize:12}}>{stat.gp} games</div></div>
-                    <div style={{textAlign:"right"}}><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:40,color:"#f97316",lineHeight:1}}>{stat.per.toFixed(1)}</div><div style={{fontSize:10,color:"#666",textTransform:"uppercase",letterSpacing:1}}>PER</div></div>
-                  </div>
-                  <div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
-                    {[["PPG",(stat.totals.pts/stat.gp).toFixed(1)],["RPG",((stat.totals.oreb+stat.totals.dreb)/stat.gp).toFixed(1)],["APG",(stat.totals.ast/stat.gp).toFixed(1)],["SPG",(stat.totals.stl/stat.gp).toFixed(1)]].map(([l,v])=>(
-                      <div key={l} style={{background:"#1a1a1a",borderRadius:8,padding:"6px 11px",textAlign:"center"}}><div style={{fontSize:16,fontWeight:700}}>{v}</div><div style={{fontSize:9,color:"#666",textTransform:"uppercase"}}>{l}</div></div>
-                    ))}
-                  </div>
+              <div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
+                {[["PPG",(stat.totals.pts/stat.gp).toFixed(1)],["RPG",((stat.totals.oreb+stat.totals.dreb)/stat.gp).toFixed(1)],["APG",(stat.totals.ast/stat.gp).toFixed(1)],["SPG",(stat.totals.stl/stat.gp).toFixed(1)]].map(([l,v])=>(
+                  <div key={l} style={{background:"#1a1a1a",borderRadius:8,padding:"6px 11px",textAlign:"center"}}><div style={{fontSize:16,fontWeight:700}}>{v}</div><div style={{fontSize:9,color:"#666",textTransform:"uppercase"}}>{l}</div></div>
+                ))}
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+              {METRICS.map(m=>{ const val=m.key==="ts"?stat.ts:m.key==="efg"?stat.efg:m.key==="per"?stat.per:stat.ato; const isEx=exp===m.key; const tier=val>=m.great?"ELITE":val>=m.good?"SOLID":"—"; const tc=val>=m.great?"#22c55e":val>=m.good?"#f97316":"#555"; return (
+                <div key={m.key} onClick={()=>setExp(isEx?null:m.key)} style={{background:"#161616",border:`1px solid ${isEx?"#f97316":"#222"}`,borderRadius:14,padding:14,cursor:"pointer",transition:"all 0.2s",gridColumn:isEx?"span 2":"span 1"}}>
+                  <div style={{display:"flex",justifyContent:"space-between"}}><div style={{fontSize:10,color:"#555",textTransform:"uppercase",letterSpacing:0.8,lineHeight:1.4}}>{m.label}</div><span style={{background:`${tc}22`,color:tc,borderRadius:5,padding:"1px 7px",fontSize:10,fontWeight:700}}>{tier}</span></div>
+                  <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:34,color:"#f97316",lineHeight:1,margin:"6px 0 2px"}}>{m.fmt(val>=999?999:val)}</div>
+                  <MBar value={val>=999?m.great*2:val} good={m.good} great={m.great}/>
+                  {isEx&&<div style={{marginTop:10,fontSize:12,color:"#888",lineHeight:1.6,borderTop:"1px solid #222",paddingTop:10}}>{m.desc}<div style={{display:"flex",gap:12,marginTop:6}}><span style={{color:"#f97316"}}>● Solid: {m.fmt(m.good)}</span><span style={{color:"#22c55e"}}>● Elite: {m.fmt(m.great)}</span></div></div>}
                 </div>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
-                  {METRICS.map(m=>{ const val=m.key==="ts"?stat.ts:m.key==="efg"?stat.efg:m.key==="per"?stat.per:stat.ato; const isEx=expanded===m.key; const tier=val>=m.great?"ELITE":val>=m.good?"SOLID":"—"; const tc=val>=m.great?"#22c55e":val>=m.good?"#f97316":"#555"; return (
-                    <div key={m.key} onClick={()=>setExp(isEx?null:m.key)} style={{background:"#161616",border:`1px solid ${isEx?"#f97316":"#222"}`,borderRadius:14,padding:14,cursor:"pointer",transition:"all 0.2s",gridColumn:isEx?"span 2":"span 1"}}>
-                      <div style={{display:"flex",justifyContent:"space-between"}}><div style={{fontSize:10,color:"#555",textTransform:"uppercase",letterSpacing:0.8,lineHeight:1.4}}>{m.label}</div><span style={{background:`${tc}22`,color:tc,borderRadius:5,padding:"1px 7px",fontSize:10,fontWeight:700}}>{tier}</span></div>
-                      <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:34,color:"#f97316",lineHeight:1,margin:"6px 0 2px"}}>{m.fmt(val>=999?999:val)}</div>
-                      <MBar value={val>=999?m.great*2:val} good={m.good} great={m.great}/>
-                      {isEx&&<div style={{marginTop:10,fontSize:12,color:"#888",lineHeight:1.6,borderTop:"1px solid #222",paddingTop:10}}>{m.desc}<div style={{display:"flex",gap:12,marginTop:6}}><span style={{color:"#f97316"}}>● Solid: {m.fmt(m.good)}</span><span style={{color:"#22c55e"}}>● Elite: {m.fmt(m.great)}</span></div></div>}
-                    </div>
-                  );})}
-                </div>
-                <Card>
-                  <SectionLbl>Shooting Splits</SectionLbl>
-                  <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:12}}>
-                    {[["FG%",stat.fgpct,0.40,0.50],["3P%",stat.tppct,0.30,0.38],["FT%",stat.ftpct,0.65,0.80]].map(([l,v,g,gr])=>(
-                      <div key={l} style={{textAlign:"center"}}><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:26,color:v>=gr?"#22c55e":v>=g?"#f97316":"#666"}}>{(v*100).toFixed(1)}%</div><div style={{fontSize:10,color:"#555",textTransform:"uppercase",marginTop:2}}>{l}</div><MBar value={v} good={g} great={gr}/></div>
-                    ))}
-                  </div>
-                  <div style={{background:"#1a1a1a",borderRadius:9,padding:"9px 12px",display:"flex",gap:14,flexWrap:"wrap"}}>
-                    {[["FG",`${stat.totals.fgm}/${stat.totals.fga}`],["3P",`${stat.totals.tpm}/${stat.totals.tpa}`],["FT",`${stat.totals.ftm}/${stat.totals.fta}`]].map(([l,v])=><span key={l} style={{fontSize:13}}><span style={{color:"#555"}}>{l}: </span><span style={{fontWeight:600}}>{v}</span></span>)}
-                  </div>
-                </Card>
-              </>:<Empty icon="📊" title="NO STATS" sub={`No games logged for ${sel?.name||"this player"} yet`}/>}
-            </>
-        }
+              );})}
+            </div>
+            <Card>
+              <SectionLbl>Shooting Splits</SectionLbl>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:12}}>
+                {[["FG%",stat.fgpct,0.40,0.50],["3P%",stat.tppct,0.30,0.38],["FT%",stat.ftpct,0.65,0.80]].map(([l,v,g,gr])=>(
+                  <div key={l} style={{textAlign:"center"}}><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:26,color:v>=gr?"#22c55e":v>=g?"#f97316":"#666"}}>{(v*100).toFixed(1)}%</div><div style={{fontSize:10,color:"#555",textTransform:"uppercase",marginTop:2}}>{l}</div><MBar value={v} good={g} great={gr}/></div>
+                ))}
+              </div>
+              <div style={{background:"#1a1a1a",borderRadius:9,padding:"9px 12px",display:"flex",gap:14,flexWrap:"wrap"}}>
+                {[["FG",`${stat.totals.fgm}/${stat.totals.fga}`],["3P",`${stat.totals.tpm}/${stat.totals.tpa}`],["FT",`${stat.totals.ftm}/${stat.totals.fta}`]].map(([l,v])=><span key={l} style={{fontSize:13}}><span style={{color:"#555"}}>{l}: </span><span style={{fontWeight:600}}>{v}</span></span>)}
+              </div>
+            </Card>
+          </>:<Empty icon="📊" title="NO STATS" sub={`No games logged for ${sel?.name||"this player"} yet`}/>}
+        </>}
       </div>
     </div>
   );
@@ -777,18 +785,18 @@ function Analytics({ players, logs }) {
 
 // ─── MODULE: LEADERBOARD ─────────────────────────────────────────────────────
 const LB_COLS=[
-  {key:"gp",  label:"GP",   fmt:v=>v},
-  {key:"ppg", label:"PPG",  fmt:v=>v.toFixed(1)},
-  {key:"rpg", label:"RPG",  fmt:v=>v.toFixed(1)},
-  {key:"apg", label:"APG",  fmt:v=>v.toFixed(1)},
-  {key:"spg", label:"SPG",  fmt:v=>v.toFixed(1)},
-  {key:"bpg", label:"BPG",  fmt:v=>v.toFixed(1)},
-  {key:"topg",label:"TOV",  fmt:v=>v.toFixed(1)},
-  {key:"ts",  label:"TS%",  fmt:v=>`${(v*100).toFixed(1)}%`,adv:true},
-  {key:"efg", label:"eFG%", fmt:v=>`${(v*100).toFixed(1)}%`,adv:true},
-  {key:"per", label:"PER",  fmt:v=>v.toFixed(1),            adv:true},
-  {key:"ato", label:"A/TO", fmt:v=>v>=999?"∞":v.toFixed(2),adv:true},
-  {key:"fgpct",label:"FG%", fmt:v=>`${(v*100).toFixed(1)}%`,adv:true},
+  {key:"gp",  label:"GP",  fmt:v=>v},
+  {key:"ppg", label:"PPG", fmt:v=>v.toFixed(1)},
+  {key:"rpg", label:"RPG", fmt:v=>v.toFixed(1)},
+  {key:"apg", label:"APG", fmt:v=>v.toFixed(1)},
+  {key:"spg", label:"SPG", fmt:v=>v.toFixed(1)},
+  {key:"bpg", label:"BPG", fmt:v=>v.toFixed(1)},
+  {key:"topg",label:"TOV", fmt:v=>v.toFixed(1)},
+  {key:"ts",  label:"TS%", fmt:v=>`${(v*100).toFixed(1)}%`,adv:true},
+  {key:"efg", label:"eFG%",fmt:v=>`${(v*100).toFixed(1)}%`,adv:true},
+  {key:"per", label:"PER", fmt:v=>v.toFixed(1),            adv:true},
+  {key:"ato", label:"A/TO",fmt:v=>v>=999?"∞":v.toFixed(2),adv:true},
+  {key:"fgpct",label:"FG%",fmt:v=>`${(v*100).toFixed(1)}%`,adv:true},
 ];
 
 function Leaderboard({ players, logs }) {
@@ -797,13 +805,10 @@ function Leaderboard({ players, logs }) {
   const [adv,setAdv]=useState(false);
   const [minGP,setMinGP]=useState(1);
 
-  const rows=players.map((p,i)=>{
-    const s=getPlayerStats(p.id,logs); if(!s) return null;
+  const rows=players.map((p,i)=>{ const s=getPlayerStats(p.id,logs); if(!s) return null;
     const t=s.totals,gp=s.gp;
     const ppg=t.pts/gp,rpg=(t.oreb+t.dreb)/gp,apg=t.ast/gp,spg=t.stl/gp,bpg=t.blk/gp,topg=t.tov/gp;
-    const anomalies=[];
-    if(ppg>ANOMALY.pts) anomalies.push(`${ppg.toFixed(1)} PPG`);
-    if(apg>ANOMALY.ast) anomalies.push(`${apg.toFixed(1)} APG`);
+    const anomalies=[]; if(ppg>ANOMALY.pts) anomalies.push(`${ppg.toFixed(1)} PPG`); if(apg>ANOMALY.ast) anomalies.push(`${apg.toFixed(1)} APG`);
     return {player:p,ci:i,gp,ppg,rpg,apg,spg,bpg,topg,ts:s.ts,efg:s.efg,per:s.per,ato:s.ato,fgpct:s.fgpct,anomalies};
   }).filter(r=>r&&r.gp>=minGP).sort((a,b)=>sortDir*(b[sortKey]-a[sortKey]));
 
@@ -822,8 +827,7 @@ function Leaderboard({ players, logs }) {
         {!players.length?<Empty icon="🏆" title="NO STATS YET" sub="Scan a scoresheet or log games to populate the leaderboard"/>:<>
           {rows.length>=2&&<div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:16}}>
             {awards.map(({icon,l,p,s})=>p&&<div key={l} style={{background:"linear-gradient(135deg,#1a1000,#161616)",border:"1px solid #f9731622",borderRadius:12,padding:"12px 10px",textAlign:"center"}}>
-              <div style={{fontSize:18,marginBottom:3}}>{icon}</div>
-              <div style={{fontSize:9,color:"#666",textTransform:"uppercase",letterSpacing:0.8,marginBottom:3}}>{l}</div>
+              <div style={{fontSize:18,marginBottom:3}}>{icon}</div><div style={{fontSize:9,color:"#666",textTransform:"uppercase",letterSpacing:0.8,marginBottom:3}}>{l}</div>
               <div style={{fontWeight:700,fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.player.name.split(" ")[0]}</div>
               <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:20,color:"#f97316",lineHeight:1.2}}>{s(p)}</div>
             </div>)}
@@ -876,10 +880,10 @@ function Leaderboard({ players, logs }) {
 
 // ─── NAV + ROOT ───────────────────────────────────────────────────────────────
 const NAV=[
-  {id:"scanner",   icon:"📸",label:"Scan"},
-  {id:"roster",    icon:"👥",label:"Players"},
-  {id:"games",     icon:"🗓",label:"Games"},
-  {id:"analytics", icon:"📊",label:"Stats"},
+  {id:"scanner",    icon:"📸",label:"Scan"},
+  {id:"roster",     icon:"👥",label:"Players"},
+  {id:"games",      icon:"🗓",label:"Games"},
+  {id:"analytics",  icon:"📊",label:"Stats"},
   {id:"leaderboard",icon:"🏆",label:"Ranks"},
 ];
 
@@ -890,32 +894,35 @@ export default function App() {
   if (!data.ready) return (
     <div style={{minHeight:"100vh",background:"#0d0d0d",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
       <div className="hoop-spinner"/>
-      <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:14,color:"#333",marginTop:16,letterSpacing:3}}>LOADING</div>
+      <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:14,color:"#333",marginTop:16,letterSpacing:3}}>CONNECTING...</div>
     </div>
   );
 
   return (
     <div style={{height:"100dvh",display:"flex",flexDirection:"column",background:"#0d0d0d",color:"#fff",overflow:"hidden"}}>
       {/* Global header */}
-      <div style={{background:"#0d0d0d",borderBottom:"1px solid #161616",padding:"12px 18px",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+      <div style={{background:"#0d0d0d",borderBottom:"1px solid #161616",padding:"10px 18px",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
         <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:22,color:"#f97316",letterSpacing:2,lineHeight:1}}>🏀 HOOPS TRACKER</div>
-        <div style={{display:"flex",gap:6}}>
-          {[["P",data.players.length,"Players"],["G",data.games.length,"Games"]].map(([l,v,tt])=>(
-            <div key={l} style={{background:"#161616",border:"1px solid #1e1e1e",borderRadius:8,padding:"4px 10px",textAlign:"center",minWidth:38}} title={tt}>
-              <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:18,color:"#f97316",lineHeight:1}}>{v}</div>
-              <div style={{fontSize:9,color:"#444",textTransform:"uppercase"}}>{tt}</div>
-            </div>
-          ))}
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <SyncDot status={data.syncStatus}/>
+          <div style={{display:"flex",gap:5}}>
+            {[["P",data.players.length,"Players"],["G",data.games.length,"Games"]].map(([l,v,tt])=>(
+              <div key={l} style={{background:"#161616",border:"1px solid #1e1e1e",borderRadius:7,padding:"3px 9px",textAlign:"center"}} title={tt}>
+                <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:17,color:"#f97316",lineHeight:1}}>{v}</div>
+                <div style={{fontSize:9,color:"#444",textTransform:"uppercase"}}>{tt}</div>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
 
       {/* Tab panels */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
-        {tab==="scanner"&&<div style={{display:"flex",flexDirection:"column",height:"100%"}}><SubHeader title="📸 SCANNER" sub="Photo → Stats in seconds"/><Scanner {...data} onDone={t=>setTab(t||"games")}/></div>}
-        {tab==="roster"&&<Roster {...data}/>}
-        {tab==="games"&&<GamesManager {...data} onNavigate={setTab}/>}
-        {tab==="analytics"&&<Analytics players={data.players} logs={data.logs}/>}
-        {tab==="leaderboard"&&<Leaderboard players={data.players} logs={data.logs}/>}
+        {tab==="scanner"    &&<div style={{display:"flex",flexDirection:"column",height:"100%"}}><SubHeader title="📸 SCANNER" sub="Photo → Stats in seconds"/><Scanner {...data} onDone={t=>setTab(t||"games")}/></div>}
+        {tab==="roster"     &&<Roster      {...data}/>}
+        {tab==="games"      &&<GamesManager {...data} onNavigate={setTab}/>}
+        {tab==="analytics"  &&<Analytics    players={data.players} logs={data.logs}/>}
+        {tab==="leaderboard"&&<Leaderboard  players={data.players} logs={data.logs}/>}
       </div>
 
       {/* Bottom nav */}
