@@ -92,13 +92,29 @@ function useAppData() {
   const [logs,    setLogs]    = useState([]);
   const [ready,   setReady]   = useState(false);
   const [syncStatus, setSyncStatus] = useState("connecting");
+  const [dbError, setDbError] = useState(null);
 
-  const loadPlayers = useCallback(async () => { const {data,error}=await supabase.from("players").select("*").order("created_at"); if(!error&&data) setPlayers(data); },[]);
-  const loadGames   = useCallback(async () => { const {data,error}=await supabase.from("games").select("*").order("date",{ascending:false}); if(!error&&data) setGames(data); },[]);
-  const loadLogs    = useCallback(async () => { const {data,error}=await supabase.from("gamelogs").select("*"); if(!error&&data) setLogs(data.map(logFromDB)); },[]);
+  const loadPlayers = useCallback(async () => { const {data,error}=await supabase.from("players").select("*").order("created_at"); if(error){ setDbError("Can't reach the database: "+error.message); return; } if(data){ setPlayers(data); } },[]);
+  const loadGames   = useCallback(async () => { const {data,error}=await supabase.from("games").select("*").order("date",{ascending:false}); if(error){ setDbError("Can't reach the database: "+error.message); return; } if(data){ setGames(data); } },[]);
+  const loadLogs    = useCallback(async () => { const {data,error}=await supabase.from("gamelogs").select("*"); if(error){ setDbError("Can't reach the database: "+error.message); return; } if(data){ setLogs(data.map(logFromDB)); } },[]);
+  const reloadAll   = useCallback(() => Promise.all([loadPlayers(),loadGames(),loadLogs()]),[loadPlayers,loadGames,loadLogs]);
+
+  // Runs DB writes in order; on any failure shows a banner, reloads the true DB state, and returns false.
+  const runWrites = async (steps) => {
+    for (const step of steps) {
+      const res = await step();
+      if (res && res.error) {
+        setDbError("NOT SAVED — database refused the change: "+res.error.message);
+        await reloadAll();
+        return false;
+      }
+    }
+    setDbError(null);
+    return true;
+  };
 
   useEffect(() => {
-    Promise.all([loadPlayers(),loadGames(),loadLogs()]).then(()=>setReady(true)).catch(()=>setSyncStatus("error"));
+    Promise.all([loadPlayers(),loadGames(),loadLogs()]).then(()=>setReady(true)).catch(e=>{ setDbError("Can't reach the database: "+e.message); setSyncStatus("error"); setReady(true); });
     const channel = supabase.channel("db-all-changes")
       .on("postgres_changes",{event:"*",schema:"public",table:"players"},  ()=>loadPlayers())
       .on("postgres_changes",{event:"*",schema:"public",table:"games"},    ()=>loadGames())
@@ -107,28 +123,37 @@ function useAppData() {
     return ()=>supabase.removeChannel(channel);
   },[loadPlayers,loadGames,loadLogs]);
 
-  const savePlayers = useCallback(async newArr => {
+  const savePlayers = async newArr => {
     const toDelete=players.filter(p=>!newArr.find(np=>np.id===p.id));
-    if(toDelete.length) await supabase.from("players").delete().in("id",toDelete.map(p=>p.id));
-    if(newArr.length)   await supabase.from("players").upsert(newArr);
-    setPlayers(newArr);
-  },[players]);
+    const ok = await runWrites([
+      ()=> toDelete.length ? supabase.from("players").delete().in("id",toDelete.map(p=>p.id)) : null,
+      ()=> newArr.length ? supabase.from("players").upsert(newArr.map(({id,name,number})=>({id,name,number}))) : null,
+    ]);
+    if(ok) setPlayers(newArr);
+    return ok;
+  };
 
-  const saveGames = useCallback(async newArr => {
+  const saveGames = async newArr => {
     const toDelete=games.filter(g=>!newArr.find(ng=>ng.id===g.id));
-    if(toDelete.length) await supabase.from("games").delete().in("id",toDelete.map(g=>g.id));
-    if(newArr.length)   await supabase.from("games").upsert(newArr);
-    setGames(newArr);
-  },[games]);
+    const ok = await runWrites([
+      ()=> toDelete.length ? supabase.from("games").delete().in("id",toDelete.map(g=>g.id)) : null,
+      ()=> newArr.length ? supabase.from("games").upsert(newArr.map(({id,date,opponent,result})=>({id,date,opponent,result}))) : null,
+    ]);
+    if(ok) setGames(newArr);
+    return ok;
+  };
 
-  const saveLogs = useCallback(async newArr => {
+  const saveLogs = async newArr => {
     const toDelete=logs.filter(l=>!newArr.find(nl=>nl.id===l.id));
-    if(toDelete.length) await supabase.from("gamelogs").delete().in("id",toDelete.map(l=>l.id));
-    if(newArr.length)   await supabase.from("gamelogs").upsert(newArr.map(logToDB));
-    setLogs(newArr);
-  },[logs]);
+    const ok = await runWrites([
+      ()=> toDelete.length ? supabase.from("gamelogs").delete().in("id",toDelete.map(l=>l.id)) : null,
+      ()=> newArr.length ? supabase.from("gamelogs").upsert(newArr.map(l=>{ const {created_at,...rest}=logToDB(l); return rest; })) : null,
+    ]);
+    if(ok) setLogs(newArr);
+    return ok;
+  };
 
-  return { players,games,logs,ready,syncStatus,savePlayers,saveGames,saveLogs };
+  return { players,games,logs,ready,syncStatus,dbError,setDbError,savePlayers,saveGames,saveLogs };
 }
 
 // ─── SHARED UI ────────────────────────────────────────────────────────────────
@@ -261,9 +286,9 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
         if(!p){ p={id:newId("p"),name:row.name.trim(),number:row.number}; updPl.push(p); }
         newLogs.push({id:newId("gl"),playerId:p.id,gameId,...Object.fromEntries(STAT_FIELDS.map(f=>[f.key,Number(row[f.key])||0]))});
       }
-      await savePlayers(updPl);
-      await saveGames([...games,{id:gameId,date:gameInfo.date,opponent:gameInfo.opponent,result:gameInfo.result}]);
-      await saveLogs([...logs,...newLogs]);
+      if(!(await savePlayers(updPl)))  throw new Error("players were not saved");
+      if(!(await saveGames([...games,{id:gameId,date:gameInfo.date,opponent:gameInfo.opponent,result:gameInfo.result}]))) throw new Error("game was not saved");
+      if(!(await saveLogs([...logs,...newLogs]))) throw new Error("player stats were not saved");
       setStep("done");
     } catch(e) { setErr("Save failed: "+e.message); setStep("review"); }
   };
@@ -883,6 +908,8 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {data.dbError&&<div className="alert-red" style={{margin:"8px 12px 0",flexShrink:0}}>⚠ {data.dbError} <button onClick={()=>data.setDbError(null)} style={{float:"right",background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:16}}>×</button></div>}
 
       {/* Tab panels */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
