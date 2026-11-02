@@ -892,9 +892,12 @@ export default function App() {
     <div style={{height:"100dvh",display:"flex",flexDirection:"column",background:T.bg,color:T.text,overflow:"hidden"}}>
       {/* Global header */}
       <div style={{background:T.bg,borderBottom:`1px solid ${T.border}`,padding:"10px 18px",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        <div>
-          <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:22,color:T.red,letterSpacing:3,lineHeight:1}}>GETTING BUCKETS</div>
-          <div style={{fontSize:9,color:"#2a0a12",letterSpacing:2,textTransform:"uppercase",marginTop:1}}>40+ League Tracker</div>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <img src="/icon-192.png" alt="Getting Buckets" width="34" height="34" style={{borderRadius:8,display:"block"}}/>
+          <div>
+            <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:22,color:T.red,letterSpacing:3,lineHeight:1}}>GETTING BUCKETS</div>
+            <div style={{fontSize:9,color:"#6b2a3a",letterSpacing:2,textTransform:"uppercase",marginTop:1}}>40+ League Tracker</div>
+          </div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
           <SyncDot status={data.syncStatus}/>
