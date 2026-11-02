@@ -228,6 +228,52 @@ function compressImage(file, maxDim=1600, quality=0.85) {
   });
 }
 
+// ─── FILE IMPORT (CSV) — for records that can't be scanned ───────────────────
+function parseCSV(text) {
+  const rows=[]; let row=[], cur="", q=false;
+  for (let i=0;i<text.length;i++) {
+    const c=text[i];
+    if(q){ if(c==='"'){ if(text[i+1]==='"'){cur+='"';i++;} else q=false; } else cur+=c; }
+    else if(c==='"') q=true;
+    else if(c===","||c==="\t"||c===";"){ row.push(cur); cur=""; }
+    else if(c==="\n"||c==="\r"){ if(c==="\r"&&text[i+1]==="\n") i++; row.push(cur); cur=""; if(row.some(x=>x.trim()!=="")) rows.push(row); row=[]; }
+    else cur+=c;
+  }
+  row.push(cur); if(row.some(x=>x.trim()!=="")) rows.push(row);
+  return rows;
+}
+const COL_ALIASES = {
+  name:["name","player","playername","player name"], number:["number","#","no","jersey","num"],
+  pts:["pts","points","pt"], fgm:["fgm","fg made"], fga:["fga","fg att","fg attempts"],
+  tpm:["3pm","tpm","3p made","threes made","3ptm"], tpa:["3pa","tpa","3p att","threes att","3pta"],
+  ftm:["ftm","ft made"], fta:["fta","ft att","ft attempts"],
+  oreb:["oreb","orb","off reb","offensive rebounds"], dreb:["dreb","drb","def reb","defensive rebounds"],
+  ast:["ast","assists","a"], stl:["stl","steals","st"], blk:["blk","blocks","bl"],
+  tov:["tov","to","turnovers","tos"], pf:["pf","fouls","foul"],
+  date:["date","game date"], opponent:["opponent","opp","vs"], result:["result","score","final"],
+};
+function mapImportedRows(table) {
+  if(table.length<2) throw new Error("The file needs a header row and at least one player row.");
+  const norm = h => h.toLowerCase().replace(/[^a-z0-9# ]/g,"").trim();
+  const header = table[0].map(norm);
+  const idx = {}; 
+  for (const [key,aliases] of Object.entries(COL_ALIASES)) {
+    const i = header.findIndex(h=>aliases.map(a=>a.replace(/[^a-z0-9# ]/g,"")).includes(h));
+    if(i>=0) idx[key]=i;
+  }
+  if(idx.name===undefined) throw new Error("Couldn't find a Name/Player column. Use the template for the exact column names.");
+  const players = table.slice(1).filter(r=>(r[idx.name]||"").trim()).map(r=>{
+    const o={...emptyStats(),name:r[idx.name].trim(),number:idx.number!==undefined?(r[idx.number]||"").trim():""};
+    for (const f of STAT_FIELDS) if(idx[f.key]!==undefined){ const n=parseFloat((r[idx[f.key]]||"").trim()); o[f.key]=isNaN(n)?"":n; }
+    return o;
+  });
+  if(!players.length) throw new Error("No player rows found under the header.");
+  const first = table[1]; const game={};
+  for (const k of ["date","opponent","result"]) if(idx[k]!==undefined && (first[idx[k]]||"").trim()) game[k]=first[idx[k]].trim();
+  return { players, game };
+}
+const TEMPLATE_CSV = "Name,Number,PTS,FGM,FGA,3PM,3PA,FTM,FTA,OREB,DREB,AST,STL,BLK,TOV,PF,Date,Opponent,Result\nMarcus Johnson,23,12,5,11,1,3,1,2,1,4,3,1,0,2,2,2026-11-01,Red Devils,W 62-54\nJohn Smith,7,8,3,8,0,2,2,2,0,3,5,2,0,1,3,,,\n";
+
 // ─── OCR (calls your secure server function — no key in the browser) ─────────
 async function runOCR(b64, mime) {
   const res = await fetch("/api/scan", {
@@ -251,6 +297,25 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
   const [gameInfo,setGame] = useState({date:today(),opponent:"",result:""});
   const [err,setErr]       = useState(null);
   const fileRef = useRef();
+  const dataRef = useRef();
+
+  const handleDataFile = async f => {
+    if(!f) return;
+    try {
+      const text = await f.text();
+      const { players:imported, game } = mapImportedRows(parseCSV(text.replace(/^\uFEFF/,"")));
+      setRows(imported); setFlags(imported.map(r=>flagStats(r)));
+      setGame(g=>({ date:game.date||g.date, opponent:g.opponent||game.opponent||"", result:g.result||game.result||"" }));
+      setErr(null); setStep("review");
+    } catch(e) { setErr("Import failed: "+e.message); }
+    if(dataRef.current) dataRef.current.value="";
+  };
+  const startManual = () => { setRows([{name:"",number:"",...emptyStats()}]); setFlags([{}]); setErr(null); setStep("review"); };
+  const downloadTemplate = () => {
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(new Blob([TEMPLATE_CSV],{type:"text/csv"}));
+    a.download="getting-buckets-template.csv"; document.body.appendChild(a); a.click(); a.remove();
+  };
 
   const handleFile = async f => {
     if(!f) return;
@@ -340,6 +405,17 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
           }
         </div>
         {step==="ready"&&<button className="btn-primary btn-full" onClick={scan}>🔍 SCAN SCORESHEET</button>}
+
+        <Card style={{marginTop:14}}>
+          <SectionLbl>Can't scan it?</SectionLbl>
+          <div style={{fontSize:12,color:T.textMuted,lineHeight:1.6,marginBottom:12}}>Import a stats file or type the numbers in. You'll review everything before it saves.</div>
+          <input ref={dataRef} type="file" accept=".csv,.tsv,.txt,text/csv,text/plain" style={{display:"none"}} onChange={e=>handleDataFile(e.target.files[0])}/>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            <button className="btn-ghost btn-full" onClick={()=>dataRef.current.click()}>📄 Import stats file (CSV)</button>
+            <button className="btn-ghost btn-full" onClick={startManual}>✍️ Enter stats manually</button>
+            <button onClick={downloadTemplate} style={{background:"none",border:"none",color:T.red,fontSize:12,cursor:"pointer",padding:"4px 0",textDecoration:"underline"}}>Download CSV template</button>
+          </div>
+        </Card>
       </>}
 
       {step==="review"&&<>
