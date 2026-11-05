@@ -40,7 +40,7 @@ const ANOMALY    = {pts:35,ast:12,stl:7,blk:7};
 const J_COLORS   = [T.red,"#3b82f6","#22c55e","#a855f7","#ec4899","#eab308","#06b6d4","#f43f5e"];
 const emptyStats = () => Object.fromEntries(STAT_FIELDS.map(f=>[f.key,""]));
 const newId      = p  => `${p}_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
-const today      = () => new Date().toISOString().slice(0,10);
+const today      = () => { const d=new Date(); d.setMinutes(d.getMinutes()-d.getTimezoneOffset()); return d.toISOString().slice(0,10); }; // local date, not UTC
 const MONTHS     = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const monthShort = d  => { try { return MONTHS[new Date(d+"T12:00:00").getMonth()]; } catch { return ""; } };
 const formatDate = d  => { try { const dt=new Date(d+"T12:00:00"); return `${MONTHS[dt.getMonth()]} ${dt.getDate()}, ${dt.getFullYear()}`; } catch { return d; } };
@@ -56,6 +56,57 @@ const calcATO = (a,t)   => t>0?a/t:a>0?999:0;
 const calcPER = (t,gp)  => !gp?0:(t.pts+0.5*t.ast+t.oreb+0.7*t.dreb+t.stl+0.7*t.blk
   -0.7*(t.fga-t.fgm)-0.4*(t.fta-t.ftm)-t.tov-0.4*t.pf)/gp;
 
+// Hollinger GameScore: one number for a single game's production (~10 solid, 20+ huge)
+const calcGmSc = l => { const n=k=>Number(l[k])||0;
+  return n("pts")+0.4*n("fgm")-0.7*n("fga")-0.4*(n("fta")-n("ftm"))+0.7*n("oreb")+0.3*n("dreb")+n("stl")+0.7*n("ast")+0.7*n("blk")-0.4*n("pf")-n("tov"); };
+
+// ─── TIME / SEASON FILTERS ────────────────────────────────────────────────────
+const RANGES=[{id:"all",label:"All time"},{id:"4w",label:"Last 4 wks"},{id:"last",label:"Last game"}];
+function filterLogs(logs, games, f) {
+  let gs=games;
+  if(f.tag) gs=gs.filter(g=>(g.tag||"")===f.tag);
+  if(f.range==="4w"){ const cut=new Date(Date.now()-28*864e5).toISOString().slice(0,10); gs=gs.filter(g=>(g.date||"")>=cut); }
+  if(f.range==="last"){ const latest=[...gs].sort((a,b)=>(b.date||"").localeCompare(a.date||""))[0]; gs=latest?[latest]:[]; }
+  if(f.range==="all"&&!f.tag) return logs;
+  const ids=new Set(gs.map(g=>g.id));
+  return logs.filter(l=>ids.has(l.gameId));
+}
+const gameTags = games => [...new Set(games.map(g=>(g.tag||"").trim()).filter(Boolean))].sort();
+const TagList = ({games}) => <datalist id="gb-tags">{gameTags(games).map(t=><option key={t} value={t}/>)}</datalist>;
+function FilterBar({ games, filter, setFilter }) {
+  const tags=gameTags(games);
+  const pill=on=>({background:on?T.red:T.bgCard,color:on?T.text:T.textMuted,border:`1px solid ${on?T.red:T.border}`,borderRadius:8,padding:"6px 10px",fontSize:12,fontWeight:600,cursor:"pointer",whiteSpace:"nowrap"});
+  return (
+    <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center",marginBottom:14}}>
+      {RANGES.map(r=><button key={r.id} onClick={()=>setFilter(x=>({...x,range:r.id}))} style={pill(filter.range===r.id)}>{r.label}</button>)}
+      {tags.length>0&&<select value={filter.tag} onChange={e=>setFilter(x=>({...x,tag:e.target.value}))} style={{marginLeft:"auto",background:filter.tag?T.redDim:T.bgCard,border:`1px solid ${filter.tag?T.red:T.border}`,borderRadius:8,color:T.text,padding:"6px 8px",fontSize:12,maxWidth:150}}>
+        <option value="">All seasons</option>{tags.map(t=><option key={t} value={t}>{t}</option>)}
+      </select>}
+    </div>
+  );
+}
+function TrendChart({ points }) {
+  if(points.length<2) return <div style={{fontSize:12,color:T.textMuted}}>Play 2+ games in this view to see a trend.</div>;
+  const W=320,H=140,P=24; const vs=points.map(p=>p.v);
+  const min=Math.min(0,...vs), max=Math.max(10,...vs);
+  const x=i=>P+i*(W-2*P)/(points.length-1); const y=v=>H-P-(v-min)/((max-min)||1)*(H-2*P);
+  const d=points.map((p,i)=>`${i?"L":"M"}${x(i).toFixed(1)} ${y(p.v).toFixed(1)}`).join(" ");
+  const avg=vs.reduce((a,b)=>a+b,0)/vs.length;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto",display:"block"}} role="img" aria-label="GameScore by game">
+      {min<0&&<line x1={P} x2={W-P} y1={y(0)} y2={y(0)} stroke="#222"/>}
+      <line x1={P} x2={W-P} y1={y(avg)} y2={y(avg)} stroke="#555" strokeDasharray="4 4"/>
+      <text x={W-P} y={y(avg)-5} fill="#777" fontSize="9" textAnchor="end">avg {avg.toFixed(1)}</text>
+      <path d={d} fill="none" stroke={T.red} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round"/>
+      {points.map((p,i)=><g key={i}>
+        <circle cx={x(i)} cy={y(p.v)} r="4" fill={T.red} stroke={T.bg} strokeWidth="1.5"><title>{`${p.label}: ${p.v.toFixed(1)}`}</title></circle>
+        {(i===0||i===points.length-1)&&<text x={x(i)} y={H-6} fill="#777" fontSize="9" textAnchor={i===0?"start":"end"}>{p.label}</text>}
+      </g>)}
+      <text x={x(points.length-1)} y={y(points[points.length-1].v)-9} fill={T.text} fontSize="11" fontWeight="700" textAnchor="end">{points[points.length-1].v.toFixed(1)}</text>
+    </svg>
+  );
+}
+
 function getPlayerStats(pid, logs) {
   const pl = logs.filter(g=>g.playerId===pid);
   if (!pl.length) return null;
@@ -66,7 +117,7 @@ function getPlayerStats(pid, logs) {
     gp, totals:t,
     avgs: Object.fromEntries(Object.entries(t).map(([k,v])=>[k,v/gp])),
     ts:calcTS(t.pts,t.fga,t.fta), efg:calcEFG(t.fgm,t.tpm,t.fga),
-    ato:calcATO(t.ast,t.tov), per:calcPER(t,gp),
+    ato:calcATO(t.ast,t.tov), per:calcPER(t,gp), gmsc:pl.reduce((a,l)=>a+calcGmSc(l),0)/gp,
     fgpct:t.fga>0?t.fgm/t.fga:0, tppct:t.tpa>0?t.tpm/t.tpa:0,
     ftpct:t.fta>0?t.ftm/t.fta:0, logs:pl,
   };
@@ -137,7 +188,7 @@ function useAppData() {
     const toDelete=games.filter(g=>!newArr.find(ng=>ng.id===g.id));
     const ok = await runWrites([
       ()=> toDelete.length ? supabase.from("games").delete().in("id",toDelete.map(g=>g.id)) : null,
-      ()=> newArr.length ? supabase.from("games").upsert(newArr.map(({id,date,opponent,result})=>({id,date,opponent,result}))) : null,
+      ()=> newArr.length ? supabase.from("games").upsert(newArr.map(({id,date,opponent,result,tag})=>({id,date,opponent,result,tag:tag||""}))) : null,
     ]);
     if(ok) setGames(newArr);
     return ok;
@@ -294,7 +345,7 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
   const [mime,setMime]     = useState("image/jpeg");
   const [rows,setRows]     = useState([]);
   const [flags,setFlags]   = useState([]);
-  const [gameInfo,setGame] = useState({date:today(),opponent:"",result:""});
+  const [gameInfo,setGame] = useState({date:today(),opponent:"",result:"",tag:""});
   const [err,setErr]       = useState(null);
   const fileRef = useRef();
   const dataRef = useRef();
@@ -305,7 +356,7 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
       const text = await f.text();
       const { players:imported, game } = mapImportedRows(parseCSV(text.replace(/^\uFEFF/,"")));
       setRows(imported); setFlags(imported.map(r=>flagStats(r)));
-      setGame(g=>({ date:game.date||g.date, opponent:g.opponent||game.opponent||"", result:g.result||game.result||"" }));
+      setGame(g=>({ date:game.date||g.date, opponent:g.opponent||game.opponent||"", result:g.result||game.result||"", tag:g.tag||"" }));
       setErr(null); setStep("review");
     } catch(e) { setErr("Import failed: "+e.message); }
     if(dataRef.current) dataRef.current.value="";
@@ -352,13 +403,13 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
         newLogs.push({id:newId("gl"),playerId:p.id,gameId,...Object.fromEntries(STAT_FIELDS.map(f=>[f.key,Number(row[f.key])||0]))});
       }
       if(!(await savePlayers(updPl)))  throw new Error("players were not saved");
-      if(!(await saveGames([...games,{id:gameId,date:gameInfo.date,opponent:gameInfo.opponent,result:gameInfo.result}]))) throw new Error("game was not saved");
+      if(!(await saveGames([...games,{id:gameId,date:gameInfo.date,opponent:gameInfo.opponent,result:gameInfo.result,tag:(gameInfo.tag||"").trim()}]))) throw new Error("game was not saved");
       if(!(await saveLogs([...logs,...newLogs]))) throw new Error("player stats were not saved");
       setStep("done");
     } catch(e) { setErr("Save failed: "+e.message); setStep("review"); }
   };
 
-  const reset = () => { setStep("upload"); setPrev(null); setB64(null); setRows([]); setFlags([]); setErr(null); setGame({date:today(),opponent:"",result:""}); };
+  const reset = () => { setStep("upload"); setPrev(null); setB64(null); setRows([]); setFlags([]); setErr(null); setGame({date:today(),opponent:"",result:"",tag:""}); };
   const totalFlags=flags.reduce((s,f)=>s+Object.keys(f).length,0);
 
   if(step==="scanning") return <Spinner label="SCANNING..." sub="Claude Vision is reading your scoresheet"/>;
@@ -391,6 +442,10 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
             <Field label="Opponent"><input type="text" value={gameInfo.opponent} placeholder="Team name" onChange={e=>setGame(g=>({...g,opponent:e.target.value}))} className="text-input"/></Field>
             <div style={{gridColumn:"span 2"}}>
               <Field label="Result (e.g. W 62-54)"><input type="text" value={gameInfo.result} placeholder="W 62-54" onChange={e=>setGame(g=>({...g,result:e.target.value}))} className="text-input" style={{width:"100%"}}/></Field>
+            </div>
+            <div style={{gridColumn:"span 2"}}>
+              <Field label="Season / Tournament (optional)"><input list="gb-tags" type="text" value={gameInfo.tag||""} placeholder="e.g. Fall 2026" onChange={e=>setGame(g=>({...g,tag:e.target.value}))} className="text-input" style={{width:"100%"}}/></Field>
+              <TagList games={games}/>
             </div>
           </div>
         </Card>
@@ -456,7 +511,7 @@ function Scanner({ players, games, logs, savePlayers, saveGames, saveLogs, onDon
 function GamesManager({ players, games, logs, saveGames, saveLogs }) {
   const [view,setView]             = useState("list");
   const [selGame,setSelGame]       = useState(null);
-  const [form,setForm]             = useState({date:today(),opponent:"",result:""});
+  const [form,setForm]             = useState({date:today(),opponent:"",result:"",tag:""});
   const [editForm,setEditForm]     = useState(null);
   const [saving,setSaving]         = useState(false);
   const [delConfirm,setDelConfirm] = useState(false);
@@ -466,7 +521,7 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
 
   const addGame = async () => {
     if(!form.opponent.trim()) return; setSaving(true);
-    await saveGames([...games,{id:newId("g"),date:form.date,opponent:form.opponent.trim(),result:form.result.trim()}]);
+    await saveGames([...games,{id:newId("g"),date:form.date,opponent:form.opponent.trim(),result:form.result.trim(),tag:(form.tag||"").trim()}]);
     setSaving(false); setView("list");
   };
   const saveEdit = async () => {
@@ -493,7 +548,7 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
   if(view==="list") return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <SubHeader title="🗓 GAMES" sub={`${games.length} game${games.length!==1?"s":""} this season`}
-        right={<button className="btn-primary" style={{padding:"7px 14px",fontSize:13}} onClick={()=>{setForm({date:today(),opponent:"",result:""});setView("add");}}>+ Add</button>}/>
+        right={<button className="btn-primary" style={{padding:"7px 14px",fontSize:13}} onClick={()=>{setForm({date:today(),opponent:"",result:"",tag:""});setView("add");}}>+ Add</button>}/>
       <div className="module-scroll">
         {sorted.length===0 ? <Empty icon="🗓" title="NO GAMES YET" sub="Add a game manually or scan a scoresheet"/>
           : sorted.map(g=>{
@@ -511,6 +566,7 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
                       <div style={{fontWeight:700,fontSize:15,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{g.opponent||"Unknown Opponent"}</div>
                       <div style={{fontSize:12,color:T.textMuted,marginTop:2,display:"flex",gap:10}}>
                         <span>{rows.length} player{rows.length!==1?"s":""}</span>
+                        {g.tag&&<span style={{color:T.red,fontWeight:600}}>{g.tag}</span>}
                         {totals.pts>0&&<span style={{color:"#888"}}>{totals.pts} team pts</span>}
                       </div>
                     </div>
@@ -536,6 +592,8 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
             <Field label="Date *"><input type="date" value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))} className="text-input"/></Field>
             <Field label="Opponent *"><input type="text" value={form.opponent} placeholder="e.g. Red Devils" onChange={e=>setForm(f=>({...f,opponent:e.target.value}))} className="text-input"/></Field>
             <Field label="Result (optional)"><input type="text" value={form.result} placeholder="e.g. W 68-54" onChange={e=>setForm(f=>({...f,result:e.target.value}))} className="text-input"/></Field>
+            <Field label="Season / Tournament (optional)"><input list="gb-tags" type="text" value={form.tag||""} placeholder="e.g. Fall 2026" onChange={e=>setForm(f=>({...f,tag:e.target.value}))} className="text-input"/></Field>
+            <TagList games={games}/>
           </div>
           <div style={{marginTop:20,display:"flex",gap:10}}>
             <button className="btn-ghost" style={{flex:1}} onClick={goBack}>Cancel</button>
@@ -556,6 +614,8 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
             <Field label="Date"><input type="date" value={editForm.date} onChange={e=>setEditForm(f=>({...f,date:e.target.value}))} className="text-input"/></Field>
             <Field label="Opponent"><input type="text" value={editForm.opponent} onChange={e=>setEditForm(f=>({...f,opponent:e.target.value}))} className="text-input"/></Field>
             <Field label="Result"><input type="text" value={editForm.result} placeholder="e.g. W 68-54" onChange={e=>setEditForm(f=>({...f,result:e.target.value}))} className="text-input"/></Field>
+            <Field label="Season / Tournament"><input list="gb-tags" type="text" value={editForm.tag||""} placeholder="e.g. Fall 2026" onChange={e=>setEditForm(f=>({...f,tag:e.target.value}))} className="text-input"/></Field>
+            <TagList games={games}/>
           </div>
           <div style={{marginTop:20,display:"flex",gap:10}}>
             <button className="btn-ghost" style={{flex:1}} onClick={goBack}>Cancel</button>
@@ -749,7 +809,7 @@ function Roster({ players, games, logs, savePlayers, saveLogs }) {
                   <div><div style={{fontWeight:600,fontSize:14}}>{g?.opponent||"Unknown"}</div><div style={{fontSize:11,color:T.textMuted}}>{g?.date||"—"}{g?.result&&` · ${g.result}`}</div></div>
                   <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:34,color:T.red,lineHeight:1}}>{l.pts}</div>
                 </div>
-                <div style={{display:"flex",flexWrap:"wrap",gap:10}}>{[["REB",(l.oreb||0)+(l.dreb||0)],["AST",l.ast],["STL",l.stl],["BLK",l.blk],["TOV",l.tov],["PF",l.pf]].map(([lb,v])=><span key={lb} style={{fontSize:12,color:T.textMuted}}><span style={{color:T.textDim}}>{lb} </span>{v}</span>)}</div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:10}}>{[["REB",(l.oreb||0)+(l.dreb||0)],["AST",l.ast],["STL",l.stl],["BLK",l.blk],["TOV",l.tov],["PF",l.pf],["GmSc",calcGmSc(l).toFixed(1)]].map(([lb,v])=><span key={lb} style={{fontSize:12,color:T.textMuted}}><span style={{color:T.textDim}}>{lb} </span>{v}</span>)}</div>
               </Card>
             );})}
           </>:<Empty icon="📊" title="NO STATS YET" sub='Tap "+ Log" above to add game stats'/>}
@@ -783,13 +843,16 @@ const METRICS=[
   {key:"efg",label:"Eff. Field Goal %",fmt:v=>`${(v*100).toFixed(1)}%`, good:0.48,great:0.56, desc:"Like FG% but gives 50% bonus credit for every 3-pointer made."},
   {key:"per",label:"PER (simplified)", fmt:v=>v.toFixed(1),             good:12,  great:18,   desc:"Player Efficiency Rating. Combines all box score stats. League average ≈ 15."},
   {key:"ato",label:"Assist / Turnover",fmt:v=>v>=999?"∞":v.toFixed(2), good:1.5, great:2.5,  desc:"Assists divided by turnovers. Higher is more efficient playmaking."},
+  {key:"gmsc",label:"Avg GameScore",  fmt:v=>v.toFixed(1),             good:8,   great:14,   desc:"Hollinger GameScore: one number for a game's total production. About 10 is a solid game; 20+ is a big night."},
 ];
 function MBar({value,good,great}) {
   const c=value>=great?T.green:value>=good?T.red:T.textDim;
   return <div style={{height:5,background:"#1e1e1e",borderRadius:3,marginTop:7,overflow:"hidden"}}><div style={{height:"100%",width:`${Math.min(100,(value/(great*1.8))*100)}%`,background:c,borderRadius:3,transition:"width 0.8s ease"}}/></div>;
 }
 
-function Analytics({ players, logs }) {
+function Analytics({ players, logs:allLogs, games, filter, setFilter }) {
+  const logs=filterLogs(allLogs,games,filter);
+  const gmap=Object.fromEntries(games.map(g=>[g.id,g]));
   const [sel,setSel]   = useState(null);
   const [exp,setExp]   = useState(null);
   useEffect(()=>{ if(players.length&&!sel) setSel(players[0]); },[players]);
@@ -799,6 +862,7 @@ function Analytics({ players, logs }) {
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <SubHeader title="📊 ANALYTICS" sub="Basketball Reference formulas"/>
       <div className="module-scroll">
+        <FilterBar games={games} filter={filter} setFilter={setFilter}/>
         {!players.length ? <Empty icon="📈" title="NO DATA YET" sub="Scan a scoresheet or log stats first"/> : <>
           <div style={{display:"flex",gap:7,overflowX:"auto",paddingBottom:6,marginBottom:18}}>
             {players.map(p=>{ const s=getPlayerStats(p.id,logs); return (
@@ -820,8 +884,12 @@ function Analytics({ players, logs }) {
                 ))}
               </div>
             </div>
+            <Card style={{marginBottom:12,padding:14}}>
+              <SectionLbl>GameScore trend</SectionLbl>
+              <TrendChart points={stat.logs.map(l=>({g:gmap[l.gameId],v:calcGmSc(l)})).filter(p=>p.g).sort((a,b)=>(a.g.date||"").localeCompare(b.g.date||"")).map(p=>({v:p.v,label:(formatDate(p.g.date)||"").replace(/, \d{4}$/,"")}))}/>
+            </Card>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
-              {METRICS.map(m=>{ const val=m.key==="ts"?stat.ts:m.key==="efg"?stat.efg:m.key==="per"?stat.per:stat.ato; const isEx=exp===m.key; const tier=val>=m.great?"ELITE":val>=m.good?"SOLID":"—"; const tc=val>=m.great?T.green:val>=m.good?T.red:T.textDim; return (
+              {METRICS.map(m=>{ const val=stat[m.key]||0; const isEx=exp===m.key; const tier=val>=m.great?"ELITE":val>=m.good?"SOLID":"—"; const tc=val>=m.great?T.green:val>=m.good?T.red:T.textDim; return (
                 <div key={m.key} onClick={()=>setExp(isEx?null:m.key)} style={{background:T.bgCard,border:`1px solid ${isEx?T.red:T.border}`,borderRadius:14,padding:14,cursor:"pointer",transition:"all 0.2s",gridColumn:isEx?"span 2":"span 1"}}>
                   <div style={{display:"flex",justifyContent:"space-between"}}><div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:0.8,lineHeight:1.4}}>{m.label}</div><span style={{background:`${tc}22`,color:tc,borderRadius:5,padding:"1px 7px",fontSize:10,fontWeight:700}}>{tier}</span></div>
                   <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:34,color:T.red,lineHeight:1,margin:"6px 0 2px"}}>{m.fmt(val>=999?999:val)}</div>
@@ -862,9 +930,11 @@ const LB_COLS=[
   {key:"per", label:"PER", fmt:v=>v.toFixed(1),            adv:true},
   {key:"ato", label:"A/TO",fmt:v=>v>=999?"∞":v.toFixed(2),adv:true},
   {key:"fgpct",label:"FG%",fmt:v=>`${(v*100).toFixed(1)}%`,adv:true},
+  {key:"gmsc",label:"GmSc",fmt:v=>v.toFixed(1),adv:true},
 ];
 
-function Leaderboard({ players, logs }) {
+function Leaderboard({ players, logs:allLogs, games, filter, setFilter }) {
+  const logs=filterLogs(allLogs,games,filter);
   const [sortKey,setSortKey]=useState("ppg");
   const [sortDir,setSortDir]=useState(-1);
   const [adv,setAdv]=useState(false);
@@ -874,7 +944,7 @@ function Leaderboard({ players, logs }) {
     const t=s.totals,gp=s.gp;
     const ppg=t.pts/gp,rpg=(t.oreb+t.dreb)/gp,apg=t.ast/gp,spg=t.stl/gp,bpg=t.blk/gp,topg=t.tov/gp;
     const anomalies=[]; if(ppg>ANOMALY.pts) anomalies.push(`${ppg.toFixed(1)} PPG`); if(apg>ANOMALY.ast) anomalies.push(`${apg.toFixed(1)} APG`);
-    return {player:p,ci:i,gp,ppg,rpg,apg,spg,bpg,topg,ts:s.ts,efg:s.efg,per:s.per,ato:s.ato,fgpct:s.fgpct,anomalies};
+    return {player:p,ci:i,gp,ppg,rpg,apg,spg,bpg,topg,ts:s.ts,efg:s.efg,per:s.per,ato:s.ato,fgpct:s.fgpct,gmsc:s.gmsc,anomalies};
   }).filter(r=>r&&r.gp>=minGP).sort((a,b)=>sortDir*(b[sortKey]-a[sortKey]));
 
   const hs=k=>{ if(sortKey===k) setSortDir(d=>-d); else{setSortKey(k);setSortDir(-1);}};
@@ -889,6 +959,7 @@ function Leaderboard({ players, logs }) {
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <SubHeader title="🏆 LEADERS" sub="Tap any column to sort"/>
       <div className="module-scroll">
+        <FilterBar games={games} filter={filter} setFilter={setFilter}/>
         {!players.length?<Empty icon="🏆" title="NO STATS YET" sub="Scan a scoresheet or log games to populate the leaderboard"/>:<>
           {rows.length>=2&&<div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:16}}>
             {awards.map(({icon,l,p,s})=>p&&<div key={l} style={{background:`linear-gradient(135deg,#130005,${T.bgCard})`,border:`1px solid ${T.redBorder}`,borderRadius:12,padding:"12px 10px",textAlign:"center"}}>
@@ -944,9 +1015,178 @@ function Leaderboard({ players, logs }) {
   );
 }
 
+// ─── MODULE: LIVE GAME ───────────────────────────────────────────────────────
+// Tap stats courtside. Makes always count as attempts. Progress is kept on this
+// phone (localStorage) until saved, so closing the app mid-game loses nothing.
+const LIVE_KEY="gb-live-v1";
+const LIVE_ACTIONS=[
+  {id:"2m",label:"2PT",sub:"MADE",good:true,d:{pts:2,fgm:1,fga:1}},
+  {id:"3m",label:"3PT",sub:"MADE",good:true,d:{pts:3,fgm:1,fga:1,tpm:1,tpa:1}},
+  {id:"fm",label:"FT", sub:"MADE",good:true,d:{pts:1,ftm:1,fta:1}},
+  {id:"2x",label:"2PT",sub:"MISS",d:{fga:1}},
+  {id:"3x",label:"3PT",sub:"MISS",d:{fga:1,tpa:1}},
+  {id:"fx",label:"FT", sub:"MISS",d:{fta:1}},
+  {id:"or",label:"OREB",d:{oreb:1}},{id:"dr",label:"DREB",d:{dreb:1}},{id:"as",label:"AST",d:{ast:1}},
+  {id:"st",label:"STL",d:{stl:1}},{id:"bk",label:"BLK",d:{blk:1}},{id:"to",label:"TOV",d:{tov:1},bad:true},
+  {id:"pf",label:"FOUL",d:{pf:1},bad:true},
+];
+const zeroStats=()=>Object.fromEntries(STAT_FIELDS.map(f=>[f.key,0]));
+const loadLive=()=>{ try{ const v=JSON.parse(localStorage.getItem(LIVE_KEY)||"null"); return v&&v.phase?v:null; }catch{ return null; } };
+const storeLive=v=>{ try{ if(v) localStorage.setItem(LIVE_KEY,JSON.stringify(v)); else localStorage.removeItem(LIVE_KEY); }catch{} };
+const freshLive=()=>({phase:"setup",game:{date:today(),opponent:"",tag:""},picked:[],newPlayers:[],stats:{},history:[],sel:null,opp:0});
+
+function LiveGame({ players, games, logs, savePlayers, saveGames, saveLogs, onDone }) {
+  const [s,setS]=useState(()=>loadLive()||freshLive());
+  const [newName,setNewName]=useState("");
+  const [newNum,setNewNum]=useState("");
+  const [showBox,setShowBox]=useState(false);
+  const [saving,setSaving]=useState(false);
+  const [err,setErr]=useState(null);
+  const [confirm,setConfirm]=useState(null);
+  useEffect(()=>{ const empty=s.phase==="setup"&&!s.picked.length&&!s.game.opponent&&!s.history.length; storeLive(empty?null:s); },[s]);
+
+  const allPlayers=[...players,...s.newPlayers.filter(np=>!players.find(p=>p.id===np.id))];
+  const pById=id=>allPlayers.find(p=>p.id===id);
+  const lineup=s.picked.map(pById).filter(Boolean);
+  const us=lineup.reduce((t,p)=>t+((s.stats[p.id]||{}).pts||0),0);
+  const last=s.history[s.history.length-1];
+  const setGameField=(k,v)=>setS(x=>({...x,game:{...x.game,[k]:v}}));
+
+  const togglePick=id=>setS(x=>({...x,picked:x.picked.includes(id)?x.picked.filter(i=>i!==id):[...x.picked,id]}));
+  const addNew=()=>{ if(!newName.trim()) return; const p={id:newId("p"),name:newName.trim(),number:newNum.trim()};
+    setS(x=>({...x,newPlayers:[...x.newPlayers,p],picked:[...x.picked,p.id]})); setNewName(""); setNewNum(""); };
+  const start=()=>setS(x=>({...x,phase:"track",sel:x.picked.includes(x.sel)?x.sel:(x.picked[0]||null),
+    stats:Object.fromEntries(x.picked.map(id=>[id,x.stats[id]||zeroStats()]))}));
+
+  const tap=a=>{ if(!s.sel) return; try{ navigator.vibrate&&navigator.vibrate(12); }catch{}
+    setS(x=>{ const cur={...(x.stats[x.sel]||zeroStats())}; for(const [k,v] of Object.entries(a.d)) cur[k]=(cur[k]||0)+v;
+      return {...x,stats:{...x.stats,[x.sel]:cur},history:[...x.history,{pid:x.sel,d:a.d,label:a.label+(a.sub?" "+a.sub.toLowerCase():"")}]}; }); };
+  const oppScore=n=>setS(x=>({...x,opp:x.opp+n,history:[...x.history,{opp:n,label:`Opponent +${n}`}]}));
+  const undo=()=>setS(x=>{ const h=x.history[x.history.length-1]; if(!h) return x; const hist=x.history.slice(0,-1);
+    if(h.opp!==undefined) return {...x,opp:Math.max(0,x.opp-h.opp),history:hist};
+    const cur={...(x.stats[h.pid]||zeroStats())}; for(const [k,v] of Object.entries(h.d)) cur[k]=Math.max(0,(cur[k]||0)-v);
+    return {...x,stats:{...x.stats,[h.pid]:cur},history:hist}; });
+
+  const finish=async()=>{
+    setSaving(true); setErr(null); setConfirm(null);
+    try {
+      const gameId=newId("g");
+      const result=(s.opp>0||us>0)?`${us>s.opp?"W":us<s.opp?"L":"T"} ${us}-${s.opp}`:"";
+      const usedNew=s.newPlayers.filter(p=>s.picked.includes(p.id)&&!players.find(q=>q.id===p.id));
+      if(usedNew.length&&!(await savePlayers([...players,...usedNew]))) throw new Error("new players were not saved");
+      if(!(await saveGames([...games,{id:gameId,date:s.game.date,opponent:s.game.opponent.trim(),result,tag:(s.game.tag||"").trim()}]))) throw new Error("game was not saved");
+      const newLogs=lineup.map(p=>({id:newId("gl"),playerId:p.id,gameId,...zeroStats(),...(s.stats[p.id]||{})}));
+      if(!(await saveLogs([...logs,...newLogs]))) throw new Error("player stats were not saved");
+      storeLive(null); setS(freshLive()); setSaving(false); onDone("games");
+    } catch(e) { setErr("Save failed: "+e.message+". Your live stats are still here, so you can try again."); setSaving(false); }
+  };
+  const discard=()=>{ storeLive(null); setS(freshLive()); setConfirm(null); setErr(null); };
+
+  if(saving) return <Spinner label="SAVING..." sub="Syncing to shared database"/>;
+
+  if(s.phase==="setup") return (
+    <div className="module-scroll">
+      {err&&<div className="alert-red">⚠ {err}</div>}
+      <Card style={{marginBottom:14}}>
+        <SectionLbl>Game Details</SectionLbl>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <Field label="Date"><input type="date" value={s.game.date} onChange={e=>setGameField("date",e.target.value)} className="text-input"/></Field>
+          <Field label="Opponent"><input type="text" value={s.game.opponent} placeholder="Team name" onChange={e=>setGameField("opponent",e.target.value)} className="text-input"/></Field>
+          <div style={{gridColumn:"span 2"}}>
+            <Field label="Season / Tournament (optional)"><input list="gb-tags" type="text" value={s.game.tag||""} placeholder="e.g. Fall 2026" onChange={e=>setGameField("tag",e.target.value)} className="text-input" style={{width:"100%"}}/></Field>
+            <TagList games={games}/>
+          </div>
+        </div>
+      </Card>
+      <Card style={{marginBottom:14}}>
+        <SectionLbl>Who's playing? ({s.picked.length})</SectionLbl>
+        {allPlayers.length===0&&<div style={{fontSize:13,color:T.textMuted,marginBottom:10}}>No players yet. Add them below.</div>}
+        <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:12}}>
+          {allPlayers.map(p=>{ const on=s.picked.includes(p.id); return (
+            <button key={p.id} onClick={()=>togglePick(p.id)} style={{background:on?T.red:T.bgInput,color:on?T.text:T.textMuted,border:`1px solid ${on?T.red:T.border2}`,borderRadius:10,padding:"9px 12px",fontSize:13,fontWeight:600,cursor:"pointer"}}>
+              {on?"✓ ":""}{p.number?`#${p.number} `:""}{p.name}
+            </button>); })}
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="New player name" className="text-input" style={{flex:1,minWidth:0}}/>
+          <input value={newNum} onChange={e=>setNewNum(e.target.value)} placeholder="#" className="text-input" style={{width:52}}/>
+          <button className="btn-ghost" onClick={addNew} disabled={!newName.trim()}>Add</button>
+        </div>
+      </Card>
+      <button className="btn-primary btn-full" disabled={!s.picked.length} onClick={start}>{s.history.length?"▶ BACK TO GAME":"🔴 START LIVE GAME"}</button>
+      {s.history.length>0&&<button className="btn-ghost btn-full" style={{marginTop:10}} onClick={()=>setConfirm("discard")}>Discard this game</button>}
+      {confirm==="discard"&&<div className="alert-red" style={{marginTop:10}}>Throw away this live game? This can't be undone.
+        <div style={{display:"flex",gap:8,marginTop:10}}><button className="btn-ghost" style={{flex:1}} onClick={()=>setConfirm(null)}>Cancel</button><button style={{flex:1,background:"#ef4444",color:"#fff",border:"none",borderRadius:10,fontWeight:700,cursor:"pointer"}} onClick={discard}>Discard</button></div></div>}
+    </div>
+  );
+
+  const selP=pById(s.sel); const st=s.stats[s.sel]||zeroStats();
+  return (
+    <div className="module-scroll" style={{paddingTop:12}}>
+      {err&&<div className="alert-red">⚠ {err}</div>}
+      <div style={{display:"flex",alignItems:"center",gap:8,background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:14,padding:"10px 14px",marginBottom:12}}>
+        <div style={{textAlign:"center",minWidth:56}}><div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:1}}>Us</div><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:40,color:T.red,lineHeight:1}}>{us}</div></div>
+        <div style={{flex:1,textAlign:"center",fontSize:11,color:T.textMuted,minWidth:0}}>
+          <div style={{fontWeight:700,color:T.text,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{s.game.opponent?`vs ${s.game.opponent}`:"Live game"}</div>
+          <div style={{marginTop:3,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{last?`Last: ${last.pid?(pById(last.pid)?.name.split(" ")[0]||"")+" ":""}${last.label}`:"Pick a player, tap a stat"}</div>
+        </div>
+        <div style={{textAlign:"center",minWidth:56}}><div style={{fontSize:10,color:T.textDim,textTransform:"uppercase",letterSpacing:1}}>Them</div><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:40,lineHeight:1}}>{s.opp}</div>
+          <div style={{display:"flex",gap:3,marginTop:4,justifyContent:"center"}}>{[1,2,3].map(n=><button key={n} onClick={()=>oppScore(n)} style={{background:T.bgInput,border:`1px solid ${T.border2}`,color:T.textMuted,borderRadius:6,padding:"4px 6px",fontSize:11,cursor:"pointer"}}>+{n}</button>)}</div>
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:6,marginBottom:8}}>
+        {lineup.map(p=>{ const on=s.sel===p.id; const ps=s.stats[p.id]||{}; return (
+          <button key={p.id} onClick={()=>setS(x=>({...x,sel:p.id}))} style={{flexShrink:0,background:on?T.red:T.bgCard,color:on?T.text:T.textMuted,border:`1px solid ${on?T.red:(ps.pf||0)>=5?"#ef4444":T.border}`,borderRadius:10,padding:"7px 11px",cursor:"pointer",minWidth:66}}>
+            <div style={{fontSize:12,fontWeight:700,whiteSpace:"nowrap"}}>{p.number?`#${p.number} `:""}{p.name.split(" ")[0]}</div>
+            <div style={{fontSize:10,opacity:.85,whiteSpace:"nowrap"}}>{ps.pts||0} pts · {ps.pf||0} PF</div>
+          </button>); })}
+        <button onClick={()=>setS(x=>({...x,phase:"setup"}))} style={{flexShrink:0,background:"none",border:`1px dashed ${T.border2}`,color:T.textMuted,borderRadius:10,padding:"7px 11px",cursor:"pointer",fontSize:12}}>+ Lineup</button>
+      </div>
+
+      {selP&&<div style={{fontSize:12,color:T.textMuted,marginBottom:8,lineHeight:1.5}}>
+        <b style={{color:T.text}}>{selP.name}</b> · {st.pts} PTS · {st.fgm}/{st.fga} FG · {st.tpm}/{st.tpa} 3P · {st.ftm}/{st.fta} FT · {st.oreb+st.dreb} REB · {st.ast} AST
+      </div>}
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:7,marginBottom:10}}>
+        {LIVE_ACTIONS.map(a=>(
+          <button key={a.id} onClick={()=>tap(a)} disabled={!s.sel}
+            style={{background:a.good?"#1a0007":T.bgCard,border:`1px solid ${a.good?T.red:a.bad?"#3a1a1a":T.border2}`,color:a.good?T.text:a.bad?"#f08a8a":"#ddd",borderRadius:12,padding:"14px 4px",cursor:"pointer",touchAction:"manipulation",userSelect:"none"}}>
+            <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:21,letterSpacing:1,lineHeight:1}}>{a.label}</div>
+            {a.sub&&<div style={{fontSize:9,fontWeight:700,letterSpacing:1,color:a.good?T.red:T.textDim,marginTop:3}}>{a.sub}</div>}
+          </button>
+        ))}
+        <button onClick={undo} disabled={!last} style={{gridColumn:"span 2",background:T.bgInput,border:`1px solid ${T.border2}`,color:last?T.text:T.textDim,borderRadius:12,padding:"14px 4px",cursor:"pointer",fontWeight:700,fontSize:13}}>↶ UNDO</button>
+      </div>
+
+      <button className="btn-ghost btn-full" style={{marginBottom:10}} onClick={()=>setShowBox(v=>!v)}>{showBox?"Hide":"Show"} box score</button>
+      {showBox&&<div style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:12,overflowX:"auto",marginBottom:10}}>
+        <table style={{width:"100%",borderCollapse:"collapse",minWidth:440,fontSize:12}}>
+          <thead><tr>{["Player","PTS","FG","3P","FT","REB","AST","STL","BLK","TO","PF"].map(h=><th key={h} style={{padding:"7px 6px",color:T.textDim,fontSize:10,textAlign:h==="Player"?"left":"center",textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+          <tbody>{lineup.map(p=>{ const t={...zeroStats(),...(s.stats[p.id]||{})}; return (
+            <tr key={p.id} style={{borderTop:`1px solid ${T.border}`}}>
+              <td style={{padding:"7px 6px",whiteSpace:"nowrap",fontWeight:600}}>{p.name}</td>
+              {[t.pts,`${t.fgm}/${t.fga}`,`${t.tpm}/${t.tpa}`,`${t.ftm}/${t.fta}`,t.oreb+t.dreb,t.ast,t.stl,t.blk,t.tov,t.pf].map((v,i)=><td key={i} style={{padding:"7px 6px",textAlign:"center",color:i===0?T.red:"#ccc",fontWeight:i===0?700:400}}>{v}</td>)}
+            </tr>); })}</tbody>
+        </table>
+      </div>}
+
+      {confirm==="finish"
+        ? <div className="alert-red" style={{color:T.text}}>Save this game ({us}–{s.opp}) to everyone's devices?
+            <div style={{display:"flex",gap:8,marginTop:10}}><button className="btn-ghost" style={{flex:1}} onClick={()=>setConfirm(null)}>Keep tracking</button><button className="btn-primary" style={{flex:1}} onClick={finish}>SAVE GAME</button></div></div>
+        : confirm==="discard"
+        ? <div className="alert-red">Throw away this live game? This can't be undone.
+            <div style={{display:"flex",gap:8,marginTop:10}}><button className="btn-ghost" style={{flex:1}} onClick={()=>setConfirm(null)}>Cancel</button><button style={{flex:1,background:"#ef4444",color:"#fff",border:"none",borderRadius:10,fontWeight:700,cursor:"pointer"}} onClick={discard}>Discard</button></div></div>
+        : <div style={{display:"flex",gap:8}}><button className="btn-ghost" style={{flex:1}} onClick={()=>setConfirm("discard")}>Discard</button><button className="btn-primary" style={{flex:2}} onClick={()=>setConfirm("finish")}>✅ FINISH & SAVE</button></div>}
+      <div style={{fontSize:11,color:T.textDim,textAlign:"center",marginTop:12}}>Live stats stay on this phone until you save, even if the app closes.</div>
+    </div>
+  );
+}
+
 // ─── NAV + ROOT ───────────────────────────────────────────────────────────────
 const NAV=[
   {id:"scanner",    icon:"📸",label:"Scan"},
+  {id:"live",       icon:"🔴",label:"Live"},
   {id:"roster",     icon:"👥",label:"Players"},
   {id:"games",      icon:"🗓",label:"Games"},
   {id:"analytics",  icon:"📊",label:"Stats"},
@@ -955,6 +1195,7 @@ const NAV=[
 
 export default function App() {
   const [tab,setTab] = useState("scanner");
+  const [filter,setFilter] = useState({range:"all",tag:""});
   const data = useAppData();
 
   if(!data.ready) return (
@@ -993,14 +1234,15 @@ export default function App() {
       {/* Tab panels */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
         {tab==="scanner"    &&<div style={{display:"flex",flexDirection:"column",height:"100%"}}><SubHeader title="📸 SCANNER" sub="Photo → Stats in seconds"/><Scanner {...data} onDone={t=>setTab(t||"games")}/></div>}
+        {tab==="live"       &&<div style={{display:"flex",flexDirection:"column",height:"100%"}}><SubHeader title="🔴 LIVE GAME" sub="Tap stats as they happen"/><LiveGame {...data} onDone={t=>setTab(t||"games")}/></div>}
         {tab==="roster"     &&<Roster       {...data}/>}
         {tab==="games"      &&<GamesManager {...data} onNavigate={setTab}/>}
-        {tab==="analytics"  &&<Analytics     players={data.players} logs={data.logs}/>}
-        {tab==="leaderboard"&&<Leaderboard   players={data.players} logs={data.logs}/>}
+        {tab==="analytics"  &&<Analytics     players={data.players} logs={data.logs} games={data.games} filter={filter} setFilter={setFilter}/>}
+        {tab==="leaderboard"&&<Leaderboard   players={data.players} logs={data.logs} games={data.games} filter={filter} setFilter={setFilter}/>}
       </div>
 
       {/* Bottom nav */}
-      <div style={{background:"#050505",borderTop:`1px solid ${T.border}`,display:"grid",gridTemplateColumns:"repeat(5,1fr)",flexShrink:0,paddingBottom:"env(safe-area-inset-bottom,0px)"}}>
+      <div style={{background:"#050505",borderTop:`1px solid ${T.border}`,display:"grid",gridTemplateColumns:`repeat(${NAV.length},1fr)`,flexShrink:0,paddingBottom:"env(safe-area-inset-bottom,0px)"}}>
         {NAV.map(n=>(
           <button key={n.id} onClick={()=>setTab(n.id)}
             style={{background:"none",border:"none",padding:"11px 2px 9px",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2,transition:"all 0.15s",position:"relative"}}>
