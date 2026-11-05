@@ -717,57 +717,98 @@ function GamesManager({ players, games, logs, saveGames, saveLogs }) {
 
 // ─── MODULE: ROSTER ───────────────────────────────────────────────────────────
 function Roster({ players, games, logs, savePlayers, saveLogs }) {
-  const [view,setView]         = useState("list");
-  const [sel,setSel]           = useState(null);
+  const [view,setView]         = useState("list");   // list | addPlayer | detail | editPlayer | logForm
+  const [selId,setSelId]       = useState(null);
   const [newName,setNewName]   = useState("");
   const [newNum,setNewNum]     = useState("");
   const [selGame,setSelGame]   = useState("");
   const [logStats,setLogStats] = useState(emptyStats());
+  const [editLogId,setEditLogId] = useState(null);   // null = adding a new game log
   const [saving,setSaving]     = useState(false);
   const [dtab,setDtab]         = useState("avgs");
+  const [confirmDel,setConfirmDel] = useState(null); // log id, or "player"
+  const [msg,setMsg]           = useState(null);
 
-  const goDetail = p => { setSel(p); setView("detail"); setDtab("avgs"); };
-  const goBack   = () => setView(view==="detail"?"list":view==="addPlayer"?"list":"detail");
+  const sel = players.find(p=>p.id===selId) || null;
+  const sortedGames = [...games].sort((a,b)=>(b.date||"").localeCompare(a.date||""));
+  const statsFrom = l => Object.fromEntries(STAT_FIELDS.map(f=>[f.key, l? (l[f.key]??0) : ""]));
 
+  const goDetail = p => { setSelId(p.id); setView("detail"); setDtab("avgs"); setConfirmDel(null); setMsg(null); };
+  const goBack   = () => { setConfirmDel(null); setMsg(null); setView(view==="detail"||view==="addPlayer"?"list":"detail"); };
+
+  // ── player ──
   const addPlayer = async () => {
     if(!newName.trim()) return; setSaving(true);
-    await savePlayers([...players,{id:newId("p"),name:newName.trim(),number:newNum.trim()}]);
-    setNewName(""); setNewNum(""); setSaving(false); setView("list");
+    const ok = await savePlayers([...players,{id:newId("p"),name:newName.trim(),number:newNum.trim()}]);
+    setSaving(false); if(ok){ setNewName(""); setNewNum(""); setView("list"); }
   };
-  const deletePlayer = async id => {
-    if(!window.confirm("Delete player and all their stats?")) return;
-    await savePlayers(players.filter(p=>p.id!==id));
-    await saveLogs(logs.filter(l=>l.playerId!==id));
-    setView("list");
+  const openEditPlayer = () => { setNewName(sel.name); setNewNum(sel.number||""); setConfirmDel(null); setView("editPlayer"); };
+  const saveEditPlayer = async () => {
+    if(!newName.trim()) return; setSaving(true);
+    const ok = await savePlayers(players.map(p=>p.id===sel.id?{...p,name:newName.trim(),number:newNum.trim()}:p));
+    setSaving(false); if(ok){ setMsg("Player updated"); setView("detail"); }
   };
-  const openAddLog = p => {
-    setSel(p); setView("addLog"); setLogStats(emptyStats());
-    const sorted=[...games].sort((a,b)=>b.date.localeCompare(a.date));
-    setSelGame(sorted.length?sorted[0].id:"");
-  };
-  const saveLog = async () => {
-    if(!sel||!selGame) return; setSaving(true);
-    const nl={id:newId("gl"),playerId:sel.id,gameId:selGame,...Object.fromEntries(STAT_FIELDS.map(f=>[f.key,Number(logStats[f.key])||0]))};
-    const ex=logs.find(l=>l.playerId===sel.id&&l.gameId===selGame);
-    await saveLogs(ex?logs.map(l=>l.id===ex.id?{...nl,id:l.id}:l):[...logs,nl]);
-    setSaving(false); setView("detail");
+  const deletePlayer = async () => {
+    setSaving(true);
+    const okLogs = await saveLogs(logs.filter(l=>l.playerId!==sel.id));
+    const ok = okLogs && await savePlayers(players.filter(p=>p.id!==sel.id));
+    setSaving(false); if(ok){ setConfirmDel(null); setSelId(null); setView("list"); }
   };
 
-  const stat=sel?getPlayerStats(sel.id,logs):null;
-  const hdrRight=view==="list"
-    ? <button className="btn-primary" style={{padding:"7px 14px",fontSize:13}} onClick={()=>setView("addPlayer")}>+ Add</button>
-    : view==="detail"
+  // ── game logs ──
+  const existingFor = gid => logs.find(l=>l.playerId===sel?.id&&l.gameId===gid);
+  const openAddLog = () => {
+    const gid = sortedGames.length?sortedGames[0].id:"";
+    const ex = gid?existingFor(gid):null;
+    setSelGame(gid); setEditLogId(ex?ex.id:null); setLogStats(ex?statsFrom(ex):emptyStats()); setMsg(null); setView("logForm");
+  };
+  const openEditLog = l => { setSelGame(l.gameId); setEditLogId(l.id); setLogStats(statsFrom(l)); setMsg(null); setView("logForm"); };
+  const pickGame = gid => {
+    setSelGame(gid);
+    const ex = existingFor(gid);
+    if(ex && ex.id!==editLogId){ setEditLogId(ex.id); setLogStats(statsFrom(ex)); setMsg("This player already has stats for that game, so you're editing them."); }
+    else if(!ex && !editLogId){ setMsg(null); }
+  };
+  const saveLog = async () => {
+    if(!sel||!selGame) return;
+    const clash = logs.find(l=>l.playerId===sel.id&&l.gameId===selGame&&l.id!==editLogId);
+    if(clash){ setMsg("This player already has stats for that game. Edit that game instead."); return; }
+    setSaving(true);
+    const nl={id:editLogId||newId("gl"),playerId:sel.id,gameId:selGame,...Object.fromEntries(STAT_FIELDS.map(f=>[f.key,Math.max(0,Number(logStats[f.key])||0)]))};
+    const ok = await saveLogs(editLogId?logs.map(l=>l.id===editLogId?nl:l):[...logs,nl]);
+    setSaving(false); if(ok){ setMsg(editLogId?"Game stats updated":"Game stats added"); setDtab("log"); setView("detail"); }
+  };
+  const deleteLog = async id => {
+    setSaving(true);
+    const ok = await saveLogs(logs.filter(l=>l.id!==id));
+    setSaving(false); if(ok){ setConfirmDel(null); setMsg("Game stats deleted"); if(view==="logForm") setView("detail"); }
+  };
+
+  const stat = sel?getPlayerStats(sel.id,logs):null;
+  const logFlags = flagStats(logStats);
+  const hdrRight = view==="list"
+    ? <button className="btn-primary" style={{padding:"7px 14px",fontSize:13}} onClick={()=>{setNewName("");setNewNum("");setView("addPlayer");}}>+ Add</button>
+    : view==="detail"&&sel
     ? <div style={{display:"flex",gap:6}}>
-        <button className="btn-primary" style={{padding:"7px 12px",fontSize:13}} onClick={()=>openAddLog(sel)}>+ Log</button>
-        <button className="btn-ghost" style={{padding:"7px 10px",fontSize:13}} onClick={()=>deletePlayer(sel.id)}>🗑</button>
+        <button className="btn-primary" style={{padding:"7px 12px",fontSize:13}} onClick={openAddLog}>+ Stats</button>
+        <button className="btn-ghost" style={{padding:"7px 10px",fontSize:13}} onClick={openEditPlayer} aria-label="Edit player">✏️</button>
       </div>
     : null;
+  const title = view==="list"?"👥 PLAYERS":view==="addPlayer"?"NEW PLAYER":view==="editPlayer"?"EDIT PLAYER":view==="logForm"?(editLogId?"EDIT GAME STATS":"ADD GAME STATS"):(sel?.name||"").toUpperCase();
+  const dangerBtn = {flex:1,background:"#ef4444",color:"#fff",border:"none",borderRadius:10,padding:"10px",fontWeight:700,cursor:"pointer",fontSize:13};
+
+  if((view!=="list"&&view!=="addPlayer")&&!sel) { return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <SubHeader title="👥 PLAYERS" showBack onBack={()=>setView("list")}/>
+      <div className="module-scroll"><Empty icon="👤" title="PLAYER NOT FOUND" sub="They may have been removed on another device."/></div>
+    </div>); }
 
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
-      <SubHeader title={view==="list"?"👥 PLAYERS":view==="detail"?sel?.name?.toUpperCase():view==="addPlayer"?"NEW PLAYER":"LOG GAME"}
-        showBack={view!=="list"} onBack={goBack} right={hdrRight}/>
+      <SubHeader title={title} showBack={view!=="list"} onBack={goBack} right={hdrRight}/>
       <div className="module-scroll">
+        {msg&&view!=="list"&&<div style={{background:T.greenDim,border:`1px solid ${T.green}55`,color:msg.startsWith("This player")?T.yellow:T.green,borderRadius:10,padding:"9px 12px",fontSize:12,marginBottom:12}}>{msg}</div>}
+
         {view==="list"&&(players.length===0 ? <Empty icon="👤" title="NO PLAYERS YET" sub="Add players or scan a scoresheet"/>
           : players.map((p,i)=>{ const s=getPlayerStats(p.id,logs); return (
               <div key={p.id} className="list-row" onClick={()=>goDetail(p)}>
@@ -778,18 +819,27 @@ function Roster({ players, games, logs, savePlayers, saveLogs }) {
             );})
         )}
 
-        {view==="addPlayer"&&<Card>
-          <SectionLbl>Player Info</SectionLbl>
-          <Field label="Full Name *"><input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="e.g. Marcus Johnson" className="text-input"/></Field>
-          <div style={{height:10}}/>
-          <Field label="Jersey Number"><input value={newNum} onChange={e=>setNewNum(e.target.value)} placeholder="23" className="text-input" style={{width:80}}/></Field>
-          <button className="btn-primary btn-full" style={{marginTop:20}} onClick={addPlayer} disabled={!newName.trim()||saving}>{saving?"SAVING...":"SAVE PLAYER"}</button>
-        </Card>}
+        {(view==="addPlayer"||view==="editPlayer")&&<>
+          <Card>
+            <SectionLbl>Player Info</SectionLbl>
+            <Field label="Full Name *"><input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="e.g. Marcus Johnson" className="text-input"/></Field>
+            <div style={{height:10}}/>
+            <Field label="Jersey Number"><input value={newNum} onChange={e=>setNewNum(e.target.value)} placeholder="23" className="text-input" style={{width:80}}/></Field>
+            <button className="btn-primary btn-full" style={{marginTop:20}} onClick={view==="addPlayer"?addPlayer:saveEditPlayer} disabled={!newName.trim()||saving}>{saving?"SAVING...":view==="addPlayer"?"SAVE PLAYER":"SAVE CHANGES"}</button>
+          </Card>
+          {view==="editPlayer"&&<Card style={{marginTop:14,border:"1px solid #ef444433"}}>
+            <SectionLbl>Remove player</SectionLbl>
+            <div style={{fontSize:12,color:T.textMuted,lineHeight:1.6,marginBottom:10}}>To fix one game, go back and use ✏️ or 🗑 on that game in the Game Log. This removes the player and <b>all</b> their game stats.</div>
+            {confirmDel==="player"
+              ? <div style={{display:"flex",gap:8}}><button className="btn-ghost" style={{flex:1}} onClick={()=>setConfirmDel(null)}>Cancel</button><button style={dangerBtn} onClick={deletePlayer} disabled={saving}>Yes, delete {sel?.name?.split(" ")[0]}</button></div>
+              : <button className="btn-ghost btn-full" style={{borderColor:"#ef444466",color:"#ef4444"}} onClick={()=>setConfirmDel("player")}>🗑 Delete player</button>}
+          </Card>}
+        </>}
 
         {view==="detail"&&sel&&<>
           <div style={{background:`linear-gradient(135deg,#130005,${T.bg})`,border:`1px solid ${T.redBorder}`,borderRadius:18,padding:18,marginBottom:14,display:"flex",alignItems:"center",gap:14}}>
             <div style={{width:60,height:60,background:T.red,borderRadius:16,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Bebas Neue',cursive",fontSize:26,color:T.text}}>{sel.number||"?"}</div>
-            <div><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:24,letterSpacing:1}}>{sel.name}</div><div style={{color:T.textMuted,fontSize:13}}>{stat?`${stat.gp} games played`:"No stats yet"}</div></div>
+            <div style={{flex:1}}><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:24,letterSpacing:1}}>{sel.name}</div><div style={{color:T.textMuted,fontSize:13}}>{stat?`${stat.gp} games played`:"No stats yet"}</div></div>
           </div>
           {stat?<>
             <div style={{display:"flex",background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:12,padding:3,marginBottom:14,gap:3}}>
@@ -797,40 +847,53 @@ function Roster({ players, games, logs, savePlayers, saveLogs }) {
                 <button key={t} onClick={()=>setDtab(t)} style={{flex:1,background:dtab===t?T.red:"transparent",color:dtab===t?T.text:T.textMuted,border:"none",borderRadius:9,padding:"8px",fontSize:13,fontWeight:600,cursor:"pointer",transition:"all 0.2s"}}>{l}</button>
               ))}
             </div>
-            {(dtab==="avgs"||dtab==="totals")&&<div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-              {[{key:"pts",l:"Points"},{key:"dreb",l:"Def Reb"},{key:"oreb",l:"Off Reb"},{key:"ast",l:"Assists"},{key:"stl",l:"Steals"},{key:"blk",l:"Blocks"},{key:"tov",l:"Turnovers"},{key:"pf",l:"Fouls"},{key:"fgm",l:"FGM"},{key:"fga",l:"FGA"},{key:"tpm",l:"3PM"},{key:"fta",l:"FTA"}].map(({key,l})=>{
-                const val=dtab==="avgs"?stat.avgs[key].toFixed(1):stat.totals[key];
-                return <div key={key} style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:12,padding:"12px 10px"}}><div style={{fontSize:10,color:T.textDim,marginBottom:3,textTransform:"uppercase"}}>{l}</div><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:26,color:T.red}}>{val}</div></div>;
-              })}
-            </div>}
-            {dtab==="log"&&stat.logs.map(l=>{ const g=games.find(g=>g.id===l.gameId); return (
+            {(dtab==="avgs"||dtab==="totals")&&<>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+                {[{key:"pts",l:"Points"},{key:"dreb",l:"Def Reb"},{key:"oreb",l:"Off Reb"},{key:"ast",l:"Assists"},{key:"stl",l:"Steals"},{key:"blk",l:"Blocks"},{key:"tov",l:"Turnovers"},{key:"pf",l:"Fouls"},{key:"fgm",l:"FGM"},{key:"fga",l:"FGA"},{key:"tpm",l:"3PM"},{key:"fta",l:"FTA"}].map(({key,l})=>{
+                  const val=dtab==="avgs"?stat.avgs[key].toFixed(1):stat.totals[key];
+                  return <div key={key} style={{background:T.bgCard,border:`1px solid ${T.border}`,borderRadius:12,padding:"12px 10px"}}><div style={{fontSize:10,color:T.textDim,marginBottom:3,textTransform:"uppercase"}}>{l}</div><div style={{fontFamily:"'Bebas Neue',cursive",fontSize:26,color:T.red}}>{val}</div></div>;
+                })}
+              </div>
+              <div style={{fontSize:11,color:T.textDim,textAlign:"center",marginTop:12}}>To fix a number, open <b>Game Log</b> and tap ✏️ on that game.</div>
+            </>}
+            {dtab==="log"&&[...stat.logs].sort((a,b)=>{const ga=games.find(g=>g.id===a.gameId),gb=games.find(g=>g.id===b.gameId);return (gb?.date||"").localeCompare(ga?.date||"");}).map(l=>{ const g=games.find(g=>g.id===l.gameId); return (
               <Card key={l.id} style={{marginBottom:8}}>
-                <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
-                  <div><div style={{fontWeight:600,fontSize:14}}>{g?.opponent||"Unknown"}</div><div style={{fontSize:11,color:T.textMuted}}>{g?.date||"—"}{g?.result&&` · ${g.result}`}</div></div>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:8,gap:10}}>
+                  <div style={{minWidth:0}}><div style={{fontWeight:600,fontSize:14}}>{g?.opponent||"Unknown"}</div><div style={{fontSize:11,color:T.textMuted}}>{g?formatDate(g.date):"—"}{g?.result&&` · ${g.result}`}</div></div>
                   <div style={{fontFamily:"'Bebas Neue',cursive",fontSize:34,color:T.red,lineHeight:1}}>{l.pts}</div>
                 </div>
-                <div style={{display:"flex",flexWrap:"wrap",gap:10}}>{[["REB",(l.oreb||0)+(l.dreb||0)],["AST",l.ast],["STL",l.stl],["BLK",l.blk],["TOV",l.tov],["PF",l.pf],["GmSc",calcGmSc(l).toFixed(1)]].map(([lb,v])=><span key={lb} style={{fontSize:12,color:T.textMuted}}><span style={{color:T.textDim}}>{lb} </span>{v}</span>)}</div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:10}}>{[["FG",`${l.fgm||0}/${l.fga||0}`],["3P",`${l.tpm||0}/${l.tpa||0}`],["FT",`${l.ftm||0}/${l.fta||0}`],["REB",(l.oreb||0)+(l.dreb||0)],["AST",l.ast],["STL",l.stl],["BLK",l.blk],["TOV",l.tov],["PF",l.pf],["GmSc",calcGmSc(l).toFixed(1)]].map(([lb,v])=><span key={lb} style={{fontSize:12,color:T.textMuted}}><span style={{color:T.textDim}}>{lb} </span>{v}</span>)}</div>
+                {confirmDel===l.id
+                  ? <div style={{display:"flex",gap:8,marginTop:10}}><button className="btn-ghost" style={{flex:1,fontSize:13}} onClick={()=>setConfirmDel(null)}>Cancel</button><button style={dangerBtn} onClick={()=>deleteLog(l.id)} disabled={saving}>Delete these stats</button></div>
+                  : <div style={{display:"flex",gap:8,marginTop:10}}>
+                      <button className="btn-ghost" style={{flex:1,padding:"7px",fontSize:13}} onClick={()=>openEditLog(l)}>✏️ Edit stats</button>
+                      <button className="btn-ghost" style={{padding:"7px 12px",fontSize:13}} onClick={()=>setConfirmDel(l.id)} aria-label="Delete this game's stats">🗑</button>
+                    </div>}
               </Card>
             );})}
-          </>:<Empty icon="📊" title="NO STATS YET" sub='Tap "+ Log" above to add game stats'/>}
+          </>:<Empty icon="📊" title="NO STATS YET" sub='Tap "+ Stats" above to add game stats'/>}
         </>}
 
-        {view==="addLog"&&sel&&<Card>
-          <SectionLbl>Select Game</SectionLbl>
+        {view==="logForm"&&sel&&<Card>
+          <SectionLbl>Game</SectionLbl>
           {games.length===0 ? <div style={{color:T.textMuted,fontSize:14,marginBottom:16}}>No games yet. Create one in the Games tab first.</div>
-            : <select value={selGame} onChange={e=>setSelGame(e.target.value)} style={{width:"100%",background:T.bgInput,border:`1px solid ${T.border2}`,borderRadius:8,color:T.text,padding:"10px 12px",fontSize:14,marginBottom:16}}>
-                {[...games].sort((a,b)=>b.date.localeCompare(a.date)).map(g=><option key={g.id} value={g.id}>{g.date} vs {g.opponent||"Unknown"}{g.result&&` (${g.result})`}</option>)}
+            : <select value={selGame} onChange={e=>pickGame(e.target.value)} style={{width:"100%",background:T.bgInput,border:`1px solid ${T.border2}`,borderRadius:8,color:T.text,padding:"10px 12px",fontSize:14,marginBottom:16}}>
+                {sortedGames.map(g=><option key={g.id} value={g.id}>{g.date} vs {g.opponent||"Unknown"}{g.result&&` (${g.result})`}{existingFor(g.id)?" ✓":""}</option>)}
               </select>}
           <SectionLbl>Stats</SectionLbl>
-          <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:16}}>
+          <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:12}}>
             {STAT_FIELDS.map(f=>(
               <div key={f.key} style={{textAlign:"center"}}>
-                <div style={{fontSize:9,color:T.textDim,marginBottom:3,fontWeight:700,textTransform:"uppercase"}}>{f.label}</div>
-                <input type="number" min="0" value={logStats[f.key]} onChange={e=>setLogStats(s=>({...s,[f.key]:e.target.value}))} style={{width:44,background:T.bgInput,border:`1px solid ${T.border2}`,borderRadius:7,color:T.text,padding:"5px 3px",textAlign:"center",fontSize:13}}/>
+                <div style={{fontSize:9,color:logFlags[f.key]?"#ef4444":T.textDim,marginBottom:3,fontWeight:700,textTransform:"uppercase"}}>{f.label}</div>
+                <input type="number" inputMode="numeric" min="0" value={logStats[f.key]} onChange={e=>setLogStats(s=>({...s,[f.key]:e.target.value}))} style={{width:46,background:logFlags[f.key]?"#1f0e0e":T.bgInput,border:`1px solid ${logFlags[f.key]?"#ef4444":T.border2}`,borderRadius:7,color:T.text,padding:"6px 3px",textAlign:"center",fontSize:14}}/>
               </div>
             ))}
           </div>
-          <button className="btn-primary btn-full" onClick={saveLog} disabled={!selGame||saving}>{saving?"SAVING...":"SAVE GAME LOG"}</button>
+          {Object.keys(logFlags).length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:12}}>{Object.entries(logFlags).map(([k,m])=><span key={k} className="badge badge-red">{STAT_FIELDS.find(f=>f.key===k)?.label}: {m}</span>)}</div>}
+          <button className="btn-primary btn-full" onClick={saveLog} disabled={!selGame||saving}>{saving?"SAVING...":editLogId?"SAVE CHANGES":"SAVE GAME STATS"}</button>
+          {editLogId&&(confirmDel===editLogId
+            ? <div style={{display:"flex",gap:8,marginTop:10}}><button className="btn-ghost" style={{flex:1,fontSize:13}} onClick={()=>setConfirmDel(null)}>Cancel</button><button style={dangerBtn} onClick={()=>deleteLog(editLogId)} disabled={saving}>Delete these stats</button></div>
+            : <button className="btn-ghost btn-full" style={{marginTop:10,borderColor:"#ef444466",color:"#ef4444"}} onClick={()=>setConfirmDel(editLogId)}>🗑 Delete this game's stats</button>)}
         </Card>}
       </div>
     </div>
